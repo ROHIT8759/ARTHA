@@ -3,6 +3,8 @@ mod products;
 mod setup;
 mod users;
 mod inventory;
+mod purchases;
+mod suppliers;
 
 use axum::Router;
 
@@ -15,5 +17,7 @@ pub fn router(state: AppState) -> Router {
         .merge(users::router())
         .merge(products::router())
         .merge(inventory::router())
+        .merge(purchases::router())
+        .merge(suppliers::router())
         .with_state(state)
 }

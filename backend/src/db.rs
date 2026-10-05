@@ -53,9 +53,11 @@ fn run_migrations(conn: &Connection) -> Result<(), ApiError> {
         )
         .unwrap_or(0);
 
-    // (version, sql) pairs, in order. `include_str!` bakes the migration
-    // into the binary so deployment is just copying one executable.
-    let migrations: &[(i64, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+    let migrations: &[(i64, &str)] = &[
+        (1, include_str!("../migrations/0001_init.sql")),
+        (2, include_str!("../migrations/0002_inventory.sql")),
+        (3, include_str!("../migrations/0003_purchases_updates.sql")),
+    ];
 
     for (version, sql) in migrations {
         if *version > applied {

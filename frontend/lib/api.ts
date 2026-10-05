@@ -163,6 +163,47 @@ export const api = {
     
   postAdjustment: (productId: string, quantityMilli: number, reason: string) => 
     request<{ status: string }>("/api/inventory/adjust", { method: "POST", body: JSON.stringify({ product_id: productId, quantity_milli: quantityMilli, reason }) }),
+
+  // --- SUPPLIERS ---
+  listSuppliers: () => request<Array<{ supplier_id: string; name: string; contact?: string; created_at: string }>>("/api/suppliers"),
+  createSupplier: (name: string, contact?: string) => 
+    request<{ supplier_id: string; name: string; contact?: string; created_at: string }>("/api/suppliers", { method: "POST", body: JSON.stringify({ name, contact }) }),
+
+  // --- PURCHASES ---
+  listPurchases: () => request<Array<{ purchase_id: string; supplier_id?: string; invoice_no?: string; invoice_date?: string; status: string; source: string; subtotal_paise: number; tax_total_paise: number; total_paise: number; created_by: string; created_at: string }>>("/api/purchases"),
+  getPurchase: (purchaseId: string) => request<{
+    purchase_id: string; supplier_id?: string; invoice_no?: string; invoice_date?: string; status: string; source: string; subtotal_paise: number; tax_total_paise: number; total_paise: number; created_by: string; created_at: string;
+    items: Array<{
+      purchase_item_id: string;
+      product_id?: string;
+      product_name_snapshot?: string;
+      batch?: string;
+      hsn_code?: string;
+      gst_rate_bps: number;
+      quantity_milli: number;
+      price_paise: number;
+      line_total_paise: number;
+    }>;
+  }>(`/api/purchases/${purchaseId}`),
+  createPurchase: (source: "manual" | "ocr") => request<{ purchase_id: string }>("/api/purchases", { method: "POST", body: JSON.stringify({ source }) }),
+  updatePurchase: (purchaseId: string, payload: unknown) => request<unknown>(`/api/purchases/${purchaseId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  approvePurchase: (purchaseId: string) => request<{ status: string }>(`/api/purchases/${purchaseId}/approve`, { method: "POST" }),
+  cancelPurchase: (purchaseId: string) => request<{ status: string }>(`/api/purchases/${purchaseId}/cancel`, { method: "POST" }),
+  
+  uploadBillImage: async (purchaseId: string, file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    const token = localStorage.getItem("token");
+    const res = await fetch(`/api/purchases/${purchaseId}/image`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}` },
+      body: formData
+    });
+    if (!res.ok) throw new Error("Upload failed");
+    return res.json() as Promise<{ image_id: string }>;
+  },
+  
+  processOcr: (purchaseId: string, imageId: string) => request<{ parsed?: { invoice_no?: string; items?: Array<Record<string, unknown>> }, status: string }>(`/api/purchases/${purchaseId}/ocr`, { method: "POST", body: JSON.stringify({ image_id: imageId }) }),
 };
 
 /** Money is stored/transported as integer paise; this is the only place
