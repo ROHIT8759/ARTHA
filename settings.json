@@ -1,0 +1,5 @@
+{
+  "allowedCommands": [
+    "Get-ChildItem -Path D:\\ARTHA\\backend\\src\\routes\\*.rs | Select-Object Name"
+  ]
+}

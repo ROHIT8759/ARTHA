@@ -78,11 +78,17 @@ pub struct CreateProductRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ListProductsQuery {
+    pub search: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateProductRequest {
     pub name: Option<String>,
     pub batch: Option<String>,
     pub hsn_code: Option<String>,
     pub gst_rate_bps: Option<i64>,
+    pub qr_code: Option<String>,
     pub price_paise: Option<i64>,
     pub cost_paise: Option<i64>,
     pub unit: Option<String>,

@@ -45,13 +45,31 @@ fn row_to_product(r: &rusqlite::Row) -> rusqlite::Result<ProductView> {
 
 const SELECT_COLUMNS: &str = "product_id, name, batch, hsn_code, gst_rate_bps, qr_code, price_paise, cost_paise, stock_qty_milli, unit, status, created_at, updated_at";
 
-async fn list_products(State(state): State<AppState>, user: AuthUser) -> Result<Json<Vec<ProductView>>, ApiError> {
+use axum::extract::Query;
+use crate::models::ListProductsQuery;
+
+async fn list_products(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<ListProductsQuery>,
+) -> Result<Json<Vec<ProductView>>, ApiError> {
     let conn = state.db.lock().expect("db mutex poisoned");
-    let sql = format!(
-        "SELECT {SELECT_COLUMNS} FROM products WHERE business_id = ?1 ORDER BY name"
-    );
+    
+    let mut sql = format!("SELECT {SELECT_COLUMNS} FROM products WHERE business_id = ?1");
+    let mut params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::from(user.business_id.clone())];
+    
+    if let Some(s) = &query.search {
+        if !s.trim().is_empty() {
+            sql.push_str(" AND (name LIKE ?2 OR qr_code LIKE ?2 OR batch LIKE ?2)");
+            params.push(rusqlite::types::Value::from(format!("%{}%", s.trim())));
+        }
+    }
+    
+    sql.push_str(" ORDER BY name");
+    
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params![user.business_id], row_to_product)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), row_to_product)?;
+    
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -141,6 +159,7 @@ async fn update_product(
     let batch = req.batch.or(current.batch);
     let hsn_code = req.hsn_code.or(current.hsn_code);
     let gst_rate_bps = req.gst_rate_bps.unwrap_or(current.gst_rate_bps);
+    let qr_code = req.qr_code.unwrap_or(current.qr_code);
     let price_paise = req.price_paise.unwrap_or(current.price_paise);
     let cost_paise = req.cost_paise.unwrap_or(current.cost_paise);
     let unit = req.unit.unwrap_or(current.unit);
@@ -150,10 +169,20 @@ async fn update_product(
         return Err(ApiError::BadRequest("status must be 'active' or 'archived'".into()));
     }
 
+    // Check QR code uniqueness if it changed
+    let dup: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM products WHERE business_id = ?1 AND qr_code = ?2 AND product_id != ?3",
+        rusqlite::params![user.business_id, qr_code.trim(), product_id],
+        |r| r.get(0),
+    )?;
+    if dup > 0 {
+        return Err(ApiError::Conflict("QR code is already assigned to another product.".into()));
+    }
+
     conn.execute(
-        "UPDATE products SET name = ?1, batch = ?2, hsn_code = ?3, gst_rate_bps = ?4, price_paise = ?5, cost_paise = ?6, unit = ?7, status = ?8, updated_at = ?9
-         WHERE product_id = ?10 AND business_id = ?11",
-        rusqlite::params![name, batch, hsn_code, gst_rate_bps, price_paise, cost_paise, unit, status, now_iso(), product_id, user.business_id],
+        "UPDATE products SET name = ?1, batch = ?2, hsn_code = ?3, gst_rate_bps = ?4, qr_code = ?5, price_paise = ?6, cost_paise = ?7, unit = ?8, status = ?9, updated_at = ?10
+         WHERE product_id = ?11 AND business_id = ?12",
+        rusqlite::params![name, batch, hsn_code, gst_rate_bps, qr_code.trim(), price_paise, cost_paise, unit, status, now_iso(), product_id, user.business_id],
     )?;
 
     crate::audit::record(&conn, &user.business_id, Some(&user.user_id), "update_product", "product", Some(&product_id), "{}")?;

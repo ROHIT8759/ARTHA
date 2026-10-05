@@ -112,7 +112,8 @@ export const api = {
   setUserStatus: (userId: string, status: "active" | "disabled") =>
     request<{ status: string }>(`/api/users/${userId}`, { method: "PATCH", body: JSON.stringify({ status }) }),
 
-  listProducts: () => request<ProductView[]>("/api/products"),
+  listProducts: (search?: string) => 
+    request<ProductView[]>(search ? `/api/products?search=${encodeURIComponent(search)}` : "/api/products"),
 
   createProduct: (body: {
     name: string;
@@ -124,6 +125,20 @@ export const api = {
     cost_paise: number;
     unit?: string;
   }) => request<ProductView>("/api/products", { method: "POST", body: JSON.stringify(body) }),
+
+  getProduct: (productId: string) => request<ProductView>(`/api/products/${productId}`),
+
+  updateProduct: (productId: string, body: Partial<{
+    name: string;
+    batch: string;
+    hsn_code: string;
+    gst_rate_bps: number;
+    qr_code: string;
+    price_paise: number;
+    cost_paise: number;
+    unit: string;
+    status: "active" | "archived";
+  }>) => request<ProductView>(`/api/products/${productId}`, { method: "PATCH", body: JSON.stringify(body) }),
 
   getProductByQr: (qrCode: string) => request<ProductView>(`/api/products/by-qr/${encodeURIComponent(qrCode)}`),
 };
