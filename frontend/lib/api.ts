@@ -141,6 +141,28 @@ export const api = {
   }>) => request<ProductView>(`/api/products/${productId}`, { method: "PATCH", body: JSON.stringify(body) }),
 
   getProductByQr: (qrCode: string) => request<ProductView>(`/api/products/by-qr/${encodeURIComponent(qrCode)}`),
+
+  // --- INVENTORY ---
+  getInventoryStatus: (productId: string) => 
+    request<{ product_id: string; current_stock_milli: number; status: string }>(`/api/inventory/${productId}`),
+    
+  getInventoryHistory: (productId: string) => 
+    request<Array<{
+      transaction_id: string;
+      product_id: string;
+      transaction_type: string;
+      quantity_milli: number;
+      reference_id?: string;
+      reason?: string;
+      created_by: string;
+      created_at: string;
+    }>>(`/api/inventory/${productId}/history`),
+    
+  postOpeningStock: (productId: string, quantityMilli: number) => 
+    request<{ status: string }>("/api/inventory/opening", { method: "POST", body: JSON.stringify({ product_id: productId, quantity_milli: quantityMilli }) }),
+    
+  postAdjustment: (productId: string, quantityMilli: number, reason: string) => 
+    request<{ status: string }>("/api/inventory/adjust", { method: "POST", body: JSON.stringify({ product_id: productId, quantity_milli: quantityMilli, reason }) }),
 };
 
 /** Money is stored/transported as integer paise; this is the only place
