@@ -1,0 +1,83 @@
+.statusBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.8rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  background-color: var(--border);
+  color: var(--foreground);
+}
+
+.indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--muted);
+}
+
+.connected {
+  background-color: #e6f4ea;
+  color: #137333;
+}
+.connected .indicator {
+  background-color: #137333;
+  box-shadow: 0 0 0 2px rgba(19, 115, 51, 0.2);
+}
+
+.disconnected, .error {
+  background-color: #fce8e6;
+  color: #c5221f;
+}
+.disconnected .indicator, .error .indicator {
+  background-color: #c5221f;
+  box-shadow: 0 0 0 2px rgba(197, 34, 31, 0.2);
+}
+
+.connecting {
+  background-color: #fef7e0;
+  color: #b06000;
+}
+.connecting .indicator {
+  background-color: #b06000;
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .connected {
+    background-color: rgba(19, 115, 51, 0.2);
+    color: #81c995;
+  }
+  .connected .indicator {
+    background-color: #81c995;
+  }
+
+  .disconnected, .error {
+    background-color: rgba(197, 34, 31, 0.2);
+    color: #f28b82;
+  }
+  .disconnected .indicator, .error .indicator {
+    background-color: #f28b82;
+  }
+
+  .connecting {
+    background-color: rgba(176, 96, 0, 0.2);
+    color: #fde293;
+  }
+  .connecting .indicator {
+    background-color: #fde293;
+  }
+}

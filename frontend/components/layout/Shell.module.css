@@ -1,0 +1,145 @@
+.shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background-color: var(--background);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1.5rem;
+  background-color: var(--background);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.headerLeft {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.brand {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.05em;
+}
+
+.headerRight {
+  display: flex;
+  align-items: center;
+}
+
+.mobileToggle {
+  display: none;
+  background: none;
+  border: none;
+  font-size: 1.5rem;
+  color: var(--foreground);
+  cursor: pointer;
+  padding: 0.25rem;
+}
+
+.layout {
+  display: flex;
+  flex: 1;
+  position: relative;
+}
+
+.sidebar {
+  width: 250px;
+  background-color: var(--background);
+  border-right: 1px solid var(--border);
+  padding: 1.5rem 0;
+  transition: transform 0.2s ease-in-out;
+}
+
+.navList {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.navLink {
+  display: block;
+  padding: 0.75rem 1.5rem;
+  color: var(--foreground);
+  text-decoration: none;
+  font-weight: 500;
+  border-left: 3px solid transparent;
+  transition: all 0.2s;
+}
+
+.navLink:hover {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+
+.navLink.active {
+  background-color: rgba(15, 107, 76, 0.1);
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+
+.mainContent {
+  flex: 1;
+  padding: 2rem;
+  overflow-x: hidden;
+}
+
+.mobileOverlay {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  z-index: 10;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .mobileToggle {
+    display: block;
+  }
+  
+  .sidebar {
+    position: fixed;
+    top: 61px; /* Height of header roughly */
+    left: 0;
+    bottom: 0;
+    z-index: 15;
+    transform: translateX(-100%);
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.1);
+  }
+  
+  .sidebarOpen {
+    transform: translateX(0);
+  }
+  
+  .mobileOverlay {
+    display: block;
+  }
+  
+  .mainContent {
+    padding: 1rem;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .navLink:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+  }
+  
+  .navLink.active {
+    background-color: rgba(61, 220, 151, 0.1);
+  }
+}

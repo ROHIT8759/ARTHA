@@ -22,16 +22,18 @@ NEXT_PUBLIC_API_BASE=http://localhost:8080
 
 | Path | Purpose |
 |---|---|
-| `lib/api.ts` | typed fetch client for every backend endpoint; the one place that knows the API shape |
-| `lib/auth-context.tsx` | React context holding the signed-in user; persists only the bearer token (in `localStorage`), re-derives the user via `GET /api/auth/me` on reload |
+| `lib/api.ts` | typed fetch client for every backend endpoint; the one place that knows the API shape. Connects dynamically based on origin for LAN setups. |
+| `lib/auth-context.tsx` | React context holding the signed-in user |
+| `components/layout/Shell.tsx` | Application shell with navigation sidebar and header. Responsive to mobile sizes. |
+| `components/layout/ConnectionStatus.tsx` | Live health-check polling component indicating if local server is reachable |
+| `components/ui/` | Reusable state UI components (EmptyState, ErrorState, LoadingState) |
+| `app/(app)` | The authenticated/main area wrapped by the Shell |
+| `app/(app)/dashboard`, `sales`, `purchases`, `products`, `inventory`, `reports`, `settings` | Shell placeholders for core application functionality |
 | `app/page.tsx` | traffic director: routes to `/setup`, `/login`, or `/dashboard` |
 | `app/setup` | first-run business + owner account creation |
 | `app/login` | staff/owner sign-in |
-| `app/dashboard` | landing screen after sign-in |
-| `app/products` | product catalog: list, create (assigns a QR code), view stock |
 
-Sales (QR-first billing) and purchases (manual + OCR-assisted) screens are
-not built yet — those are V0.1/V0.2 per the roadmap.
+Sales, Purchases, Inventory, Reports, and Settings screens are currently placeholders awaiting implementation in future phases.
 
 ## Notes
 

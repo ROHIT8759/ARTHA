@@ -1,0 +1,48 @@
+.container {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  padding: 1.5rem;
+  border-radius: 8px;
+  background-color: #fce8e6;
+  border: 1px solid #fad2cf;
+  margin: 1rem 0;
+}
+
+.icon {
+  color: #c5221f;
+  flex-shrink: 0;
+  margin-top: 0.1rem;
+}
+
+.content {
+  flex: 1;
+}
+
+.title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0 0 0.5rem 0;
+  color: #c5221f;
+}
+
+.message {
+  margin: 0;
+  color: #3c4043;
+  line-height: 1.5;
+}
+
+@media (prefers-color-scheme: dark) {
+  .container {
+    background-color: rgba(197, 34, 31, 0.1);
+    border-color: rgba(197, 34, 31, 0.3);
+  }
+  
+  .title {
+    color: #f28b82;
+  }
+  
+  .message {
+    color: #e8eaed;
+  }
+}
