@@ -1,0 +1,11 @@
+/backend/target/
+/backend/data/
+/data/
+node_modules/
+.next/
+out/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.local
