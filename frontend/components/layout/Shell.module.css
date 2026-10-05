@@ -33,6 +33,40 @@
 .headerRight {
   display: flex;
   align-items: center;
+  gap: 1.5rem;
+}
+
+.userInfo {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  font-size: 0.9rem;
+}
+
+.userName {
+  font-weight: 500;
+}
+
+.userRole {
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+}
+
+.logoutBtn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.3rem 0.6rem;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.8rem;
+  transition: all 0.2s;
+}
+
+.logoutBtn:hover {
+  background-color: var(--border);
+  color: var(--foreground);
 }
 
 .mobileToggle {
