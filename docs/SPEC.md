@@ -384,3 +384,4 @@ A small business installs the application on the owner's PC. The PC becomes the 
 ## 21. Development Rule
 
 Do not add technology just because it is available. Every component must have a clear reason, remain replaceable where practical, and support the core goals: offline operation, reliability, simplicity, security, maintainability, and zero mandatory cloud/API cost.
+

@@ -71,7 +71,11 @@ fn run_migrations(conn: &Connection) -> Result<(), ApiError> {
     Ok(())
 }
 
-#[cfg(test)]
+/// An in-memory, already-migrated database. Used by both this module's own
+/// unit tests and the integration tests under `tests/` (which link against
+/// a normal, non-`cfg(test)` build of this crate — a `#[cfg(test)]` guard
+/// here would make the function disappear for them, not just for release
+/// builds).
 pub fn open_in_memory() -> Connection {
     let conn = Connection::open_in_memory().expect("open in-memory sqlite");
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
