@@ -17,13 +17,17 @@ just "how to run and extend what's here."
 cargo run
 ```
 
-Env vars (all optional):
+Env vars (all optional — see `src/config.rs`; no cloud configuration exists
+to set):
 
 | Var | Default | Meaning |
 |---|---|---|
-| `ARTHA_BIND` | `0.0.0.0:8080` | address the server listens on |
+| `ARTHA_HOST` | `0.0.0.0` | interface the server listens on |
+| `ARTHA_PORT` | `8080` | port the server listens on |
 | `ARTHA_DB_PATH` | `data/artha.db` | SQLite file location (created if missing) |
-| `RUST_LOG` | `info` | tracing log level, e.g. `debug`, `artha_server=debug` |
+| `ARTHA_LOG_LEVEL` | `info` | tracing log level, e.g. `debug` |
+| `ARTHA_ENV` | `development` | `development` or `production` — controls log formatting (ANSI colors in dev, plain in prod) |
+| `RUST_LOG` | — | if set, overrides `ARTHA_LOG_LEVEL` with the usual `tracing_subscriber` filter syntax, e.g. `artha_server=debug` |
 
 The database is created and migrated automatically on first start. There
 is no separate "init" step — `POST /api/setup` (called once by the
@@ -35,13 +39,18 @@ frontend's first-run screen) creates the business and owner account.
 cargo test
 ```
 
-`tests/smoke.rs` drives the real router (in-memory SQLite) through the
-core V0 flow: setup → login → RBAC rejection → product CRUD → QR lookup.
+- `tests/foundation.rs` — infrastructure layer: app startup, database
+  init + migration execution, the health endpoint, configuration loading.
+- `tests/smoke.rs` — the full V0 feature flow: setup → login → RBAC
+  rejection → product CRUD → QR lookup.
+- Each module also carries its own unit tests (`src/config.rs`, `src/db.rs`).
 
 ## Module map
 
 | Module | Responsibility |
 |---|---|
+| `config` | `Config`: host/port/db path/log level/dev-or-prod, loaded from env vars |
+| `logging` | one-time `tracing` subscriber setup, driven by `Config` |
 | `db` | connection setup (WAL, foreign keys), migration runner |
 | `auth` | password hashing (Argon2), session tokens, the `AuthUser` extractor that enforces auth + role on every protected handler |
 | `audit` | append-only log of sensitive actions |
