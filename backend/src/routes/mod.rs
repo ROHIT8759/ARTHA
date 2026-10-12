@@ -9,6 +9,7 @@ mod suppliers;
 mod users;
 
 use axum::Router;
+use tower_http::cors::CorsLayer;
 
 use crate::AppState;
 
@@ -23,5 +24,6 @@ pub fn router(state: AppState) -> Router {
         .merge(suppliers::router())
         .merge(sales::router())
         .merge(business::router())
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }
