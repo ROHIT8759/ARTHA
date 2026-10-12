@@ -497,3 +497,13 @@ export function calculateLineTaxPaise(taxablePaise: number, gstRateBps: number):
   return Math.floor((taxablePaise * gstRateBps + 5000) / 10000);
 }
 
+/**
+ * Formats GST rate in basis points (bps) to percentage string.
+ * Preserves integer percentages without decimal places (e.g., 1800 -> "18%"),
+ * while correctly formatting fractional percentages (e.g., 825 -> "8.25%").
+ */
+export function formatGstRate(rateBps: number): string {
+  const isWhole = rateBps % 100 === 0;
+  return `${isWhole ? (rateBps / 100).toFixed(0) : (rateBps / 100).toFixed(2)}%`;
+}
+

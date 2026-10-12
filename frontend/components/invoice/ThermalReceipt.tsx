@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { SaleView, BusinessView, formatPaise, amountToWords, computeTaxSlabs } from "@/lib/api";
+import { SaleView, BusinessView, formatPaise, amountToWords, computeTaxSlabs, formatGstRate } from "@/lib/api";
 
 interface ThermalReceiptProps {
   sale: SaleView;
@@ -216,7 +216,7 @@ export default function ThermalReceipt({ sale, business }: ThermalReceiptProps) 
           {slabList.map((slab) => (
             <div key={slab.rateBps} style={{ display: "flex", justifyContent: "space-between" }}>
               <span>
-                {slab.rateBps % 100 === 0 ? (slab.rateBps / 100).toFixed(0) : (slab.rateBps / 100).toFixed(2)}% on{" "}
+                {formatGstRate(slab.rateBps)} on{" "}
                 {formatPaise(slab.taxablePaise)}:
               </span>
               <span>{formatPaise(slab.taxPaise)}</span>

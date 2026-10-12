@@ -6,6 +6,7 @@ import {
   computeTaxSlabs,
   calculateItemSubtotalPaise,
   calculateLineTaxPaise,
+  formatGstRate,
 } from "../lib/api.ts";
 
 describe("formatPaise - Indian Currency Formatter", () => {
@@ -215,6 +216,25 @@ describe("computeTaxSlabs - Authoritative Tax Slabs & Integer Derivation", () =>
     assert.equal(slabs[1200].taxablePaise, 77 - 8); // 69
     assert.equal(slabs[1200].taxPaise, 8);
     assert.equal(slabs[1200].taxablePaise + slabs[1200].taxPaise, 77);
+  });
+});
+
+describe("formatGstRate - GST Rate Percentage Formatter", () => {
+  test("formats whole integer GST rates without decimal places", () => {
+    assert.equal(formatGstRate(0), "0%");
+    assert.equal(formatGstRate(500), "5%");
+    assert.equal(formatGstRate(1200), "12%");
+    assert.equal(formatGstRate(1800), "18%");
+    assert.equal(formatGstRate(2800), "28%");
+  });
+
+  test("formats non-whole percentages correctly preserving decimals (regression test)", () => {
+    // 825 basis points must display as 8.25%
+    assert.equal(formatGstRate(825), "8.25%");
+    // Other fractional percentages
+    assert.equal(formatGstRate(250), "2.50%");
+    assert.equal(formatGstRate(125), "1.25%");
+    assert.equal(formatGstRate(75), "0.75%");
   });
 });
 

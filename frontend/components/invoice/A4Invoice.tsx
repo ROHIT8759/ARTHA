@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { SaleView, BusinessView, formatPaise, amountToWords, computeTaxSlabs } from "@/lib/api";
+import { SaleView, BusinessView, formatPaise, amountToWords, computeTaxSlabs, formatGstRate } from "@/lib/api";
 
 interface A4InvoiceProps {
   sale: SaleView;
@@ -359,7 +359,7 @@ export default function A4Invoice({ sale, business }: A4InvoiceProps) {
                     {item.discount_paise > 0 ? formatPaise(item.discount_paise) : "—"}
                   </td>
                   <td style={{ padding: "0.65rem 0.5rem", textAlign: "right", fontSize: "0.85rem" }}>
-                    {(item.gst_rate_bps / 100).toFixed(0)}%
+                    {formatGstRate(item.gst_rate_bps)}
                   </td>
                   <td style={{ padding: "0.65rem 0.5rem", textAlign: "right", fontWeight: 700, fontSize: "0.9rem", color: "#111827" }}>
                     {formatPaise(item.line_total_paise)}
@@ -401,7 +401,7 @@ export default function A4Invoice({ sale, business }: A4InvoiceProps) {
               <tbody>
                 {slabList.map((slab) => (
                   <tr key={slab.rateBps} style={{ borderBottom: "1px solid #f3f4f6" }}>
-                    <td style={{ padding: "0.35rem 0.4rem", fontWeight: 600 }}>{(slab.rateBps / 100).toFixed(0)}%</td>
+                    <td style={{ padding: "0.35rem 0.4rem", fontWeight: 600 }}>{formatGstRate(slab.rateBps)}</td>
                     <td style={{ padding: "0.35rem 0.4rem", textAlign: "right" }}>{formatPaise(slab.taxablePaise)}</td>
                     <td style={{ padding: "0.35rem 0.4rem", textAlign: "right", fontWeight: 600 }}>{formatPaise(slab.taxPaise)}</td>
                   </tr>
