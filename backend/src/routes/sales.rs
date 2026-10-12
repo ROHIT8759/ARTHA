@@ -792,16 +792,12 @@ async fn void_sale(
             )?;
         }
 
-        // Refund payments
+        // Update sale status to void.
+        // Financial integrity: The payment collection record remains on file as 'completed'.
+        // We do NOT mark payments or sale payment_status as 'refunded' because ARTHA has no
+        // automated refund integration. Any customer payout/refund is manual out-of-band.
         tx.execute(
-            "UPDATE payments SET status = 'refunded' WHERE sale_id = ?1",
-            rusqlite::params![id],
-        )?;
-
-        // Update sale status
-        tx.execute(
-            "UPDATE sales SET status = 'void', payment_status = 'refunded', updated_at = ?1 \
-             WHERE sale_id = ?2",
+            "UPDATE sales SET status = 'void', updated_at = ?1 WHERE sale_id = ?2",
             rusqlite::params![now, id],
         )?;
     }
@@ -817,7 +813,9 @@ async fn void_sale(
             "sale_id": id,
             "invoice_no": invoice_no,
             "previous_status": status,
-            "reason": reason
+            "reason": reason,
+            "inventory_restored": status == "completed",
+            "refund_issued": false
         })
         .to_string(),
     )?;

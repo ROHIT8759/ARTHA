@@ -196,7 +196,9 @@ export default function SalesPage() {
                         {sale.payment_method}
                       </span>
                       {sale.payment_status === "paid" && (
-                        <span style={{ marginLeft: "0.4rem", color: "var(--accent)", fontSize: "0.8rem" }}>● Paid</span>
+                        <span style={{ marginLeft: "0.4rem", color: sale.status === "void" ? "var(--muted)" : "var(--accent)", fontSize: "0.8rem" }}>
+                          ● {sale.status === "void" ? "Paid (Unrefunded)" : "Paid"}
+                        </span>
                       )}
                     </td>
                     <td style={{ textAlign: "right", fontWeight: 600 }}>

@@ -228,9 +228,9 @@ export default function SaleDetailPage() {
     setCart((prev) => prev.filter((_, i) => i !== index));
   };
 
-  // Live client-side calculation estimates for responsive feedback
+  // Live client-side calculation estimates strictly using integer paise arithmetic matching backend
   const calculatedSubtotal = cart.reduce((acc, item) => {
-    const lineSub = Math.round((item.quantity_milli / 1000) * item.unit_price_paise);
+    const lineSub = Math.floor((item.quantity_milli * item.unit_price_paise + 500) / 1000);
     return acc + lineSub;
   }, 0);
 
@@ -238,9 +238,9 @@ export default function SaleDetailPage() {
   const totalCalculatedDiscount = calculatedLineDiscounts + billDiscountPaise;
 
   const calculatedTax = cart.reduce((acc, item) => {
-    const lineSub = Math.round((item.quantity_milli / 1000) * item.unit_price_paise);
+    const lineSub = Math.floor((item.quantity_milli * item.unit_price_paise + 500) / 1000);
     const taxable = Math.max(0, lineSub - item.discount_paise);
-    const lineTax = Math.round((taxable * item.gst_rate_bps) / 10000);
+    const lineTax = Math.floor((taxable * item.gst_rate_bps + 5000) / 10000);
     return acc + lineTax;
   }, 0);
 
@@ -325,7 +325,7 @@ export default function SaleDetailPage() {
   const handleVoid = async () => {
     const isCompleted = sale?.status === "completed";
     const promptMsg = isCompleted
-      ? "VOID this completed invoice? This will restore inventory stock to the ledger and refund the payment record."
+      ? "VOID this completed invoice? This will restore inventory stock to the ledger. Note: Payment collection remains on record; no automated payment refund is issued (any customer refund must be handled manually)."
       : "Cancel and void this draft sale?";
 
     if (!confirm(promptMsg)) return;
@@ -371,9 +371,9 @@ export default function SaleDetailPage() {
             tax_total_paise: calculatedTax,
             grand_total_paise: calculatedGrandTotal,
             items: cart.map((c, i) => {
-              const lineSub = Math.round((c.quantity_milli / 1000) * c.unit_price_paise);
+              const lineSub = Math.floor((c.quantity_milli * c.unit_price_paise + 500) / 1000);
               const taxable = Math.max(0, lineSub - c.discount_paise);
-              const lineTax = Math.round((taxable * c.gst_rate_bps) / 10000);
+              const lineTax = Math.floor((taxable * c.gst_rate_bps + 5000) / 10000);
               return {
                 sale_item_id: c.sale_item_id || `draft-item-${i}`,
                 sale_id: sale.sale_id,
@@ -700,9 +700,9 @@ export default function SaleDetailPage() {
                 <tbody>
                   {cart.map((item, idx) => {
                     const units = item.quantity_milli / 1000;
-                    const lineSub = Math.round(units * item.unit_price_paise);
+                    const lineSub = Math.floor((item.quantity_milli * item.unit_price_paise + 500) / 1000);
                     const taxable = Math.max(0, lineSub - item.discount_paise);
-                    const lineTax = Math.round((taxable * item.gst_rate_bps) / 10000);
+                    const lineTax = Math.floor((taxable * item.gst_rate_bps + 5000) / 10000);
                     const lineTotal = taxable + lineTax;
 
                     return (

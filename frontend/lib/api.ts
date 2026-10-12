@@ -450,3 +450,50 @@ export function amountToWords(paise: number): string {
 
   return (paise < 0 ? "Minus " : "") + words.trim() + " Only";
 }
+
+export interface TaxSlabBreakdown {
+  rateBps: number;
+  taxablePaise: number;
+  taxPaise: number;
+}
+
+/**
+ * Derives tax slabs grouped by gst_rate_bps using authoritative integer arithmetic.
+ * Derivation identity: taxable = line_total_paise - tax_paise (exact integer paise, no float rounding errors).
+ */
+export function computeTaxSlabs(
+  items: Array<{ gst_rate_bps: number; line_total_paise: number; tax_paise: number }>
+): Record<number, TaxSlabBreakdown> {
+  const slabs: Record<number, TaxSlabBreakdown> = {};
+  for (const item of items || []) {
+    const lineTax = item.tax_paise ?? 0;
+    const taxable = Math.max(0, (item.line_total_paise ?? 0) - lineTax);
+    if (!slabs[item.gst_rate_bps]) {
+      slabs[item.gst_rate_bps] = {
+        rateBps: item.gst_rate_bps,
+        taxablePaise: 0,
+        taxPaise: 0,
+      };
+    }
+    slabs[item.gst_rate_bps].taxablePaise += taxable;
+    slabs[item.gst_rate_bps].taxPaise += lineTax;
+  }
+  return slabs;
+}
+
+/**
+ * Calculates item subtotal in paise from quantity in milli-units and unit price in paise.
+ * Uses integer rounding: Math.floor((quantityMilli * unitPricePaise + 500) / 1000).
+ */
+export function calculateItemSubtotalPaise(quantityMilli: number, unitPricePaise: number): number {
+  return Math.floor((quantityMilli * unitPricePaise + 500) / 1000);
+}
+
+/**
+ * Calculates line tax in paise from taxable amount and GST rate in basis points (bps).
+ * Uses integer rounding: Math.floor((taxablePaise * gstRateBps + 5000) / 10000).
+ */
+export function calculateLineTaxPaise(taxablePaise: number, gstRateBps: number): number {
+  return Math.floor((taxablePaise * gstRateBps + 5000) / 10000);
+}
+

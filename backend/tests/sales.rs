@@ -580,7 +580,9 @@ async fn test_void_behavior_draft_and_completed() {
     assert_eq!(void_comp_resp.status(), StatusCode::OK);
     let void_body = body_json(void_comp_resp).await;
     assert_eq!(void_body["status"], "void");
-    assert_eq!(void_body["payment_status"], "refunded");
+    // Financial integrity: Voiding does NOT falsely claim an unperformed payment refund
+    assert_eq!(void_body["payment_status"], "paid");
+    assert_eq!(void_body["payments"][0]["status"], "completed");
 
     // 26. Void restores inventory ledger balance back to 10_000!
     let inv_restored = app

@@ -113,7 +113,7 @@ async fn update_business(
         }
     }
 
-    let conn = state.db.lock().expect("db mutex poisoned");
+    let mut conn = state.db.lock().expect("db mutex poisoned");
 
     // Fetch existing settings
     let current = fetch_business(&conn, &user.business_id)?;
@@ -172,13 +172,14 @@ async fn update_business(
         .map_err(|e| ApiError::Internal(format!("Failed to serialize settings: {e}")))?;
 
     let now = now_iso();
-    conn.execute(
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE businesses SET name = ?1, settings_json = ?2, updated_at = ?3 WHERE business_id = ?4",
         rusqlite::params![updated_name, settings_json, now, user.business_id],
     )?;
 
     crate::audit::record(
-        &conn,
+        &tx,
         &user.business_id,
         Some(&user.user_id),
         "update_business_settings",
@@ -186,11 +187,169 @@ async fn update_business(
         Some(&user.business_id),
         &serde_json::json!({ "name": updated_name }).to_string(),
     )?;
+    tx.commit()?;
 
     fetch_business(&conn, &user.business_id).map(Json)
 }
 
-/// POST /api/business/logo - Upload business logo (raster only, max 1MB)
+/// Maximum permitted binary decoded logo size: 1 MiB (1,048,576 bytes)
+const MAX_LOGO_BYTES: usize = 1_048_576;
+
+/// Strictly decodes standard RFC 4648 Base64 without external crates.
+/// Rejects non-base64 characters, improper length, invalid padding, and dirty padding bits.
+fn strict_decode_base64(input: &str) -> Result<Vec<u8>, ApiError> {
+    if input.is_empty() {
+        return Err(ApiError::BadRequest("Base64 payload is empty".into()));
+    }
+
+    let bytes = input.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err(ApiError::BadRequest("Base64 payload length must be a multiple of 4".into()));
+    }
+
+    let mut out = Vec::with_capacity((bytes.len() / 4) * 3);
+
+    let decode_char = |b: u8| -> Result<u8, ApiError> {
+        match b {
+            b'A'..=b'Z' => Ok(b - b'A'),
+            b'a'..=b'z' => Ok(b - b'a' + 26),
+            b'0'..=b'9' => Ok(b - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(ApiError::BadRequest("Invalid Base64 character in image payload".into())),
+        }
+    };
+
+    let chunks = bytes.chunks_exact(4);
+    let chunk_count = chunks.len();
+
+    for (chunk_idx, chunk) in chunks.enumerate() {
+        let is_last = chunk_idx == chunk_count - 1;
+
+        if is_last {
+            if chunk[2] == b'=' {
+                if chunk[3] != b'=' {
+                    return Err(ApiError::BadRequest("Invalid Base64 padding structure".into()));
+                }
+                let c0 = decode_char(chunk[0])?;
+                let c1 = decode_char(chunk[1])?;
+                if c1 & 0x0F != 0 {
+                    return Err(ApiError::BadRequest("Invalid Base64 padding bits".into()));
+                }
+                out.push((c0 << 2) | (c1 >> 4));
+            } else if chunk[3] == b'=' {
+                let c0 = decode_char(chunk[0])?;
+                let c1 = decode_char(chunk[1])?;
+                let c2 = decode_char(chunk[2])?;
+                if c2 & 0x03 != 0 {
+                    return Err(ApiError::BadRequest("Invalid Base64 padding bits".into()));
+                }
+                out.push((c0 << 2) | (c1 >> 4));
+                out.push((c1 << 4) | (c2 >> 2));
+            } else {
+                let c0 = decode_char(chunk[0])?;
+                let c1 = decode_char(chunk[1])?;
+                let c2 = decode_char(chunk[2])?;
+                let c3 = decode_char(chunk[3])?;
+                out.push((c0 << 2) | (c1 >> 4));
+                out.push((c1 << 4) | (c2 >> 2));
+                out.push((c2 << 6) | c3);
+            }
+        } else {
+            if chunk.contains(&b'=') {
+                return Err(ApiError::BadRequest("Base64 padding '=' found before end of payload".into()));
+            }
+            let c0 = decode_char(chunk[0])?;
+            let c1 = decode_char(chunk[1])?;
+            let c2 = decode_char(chunk[2])?;
+            let c3 = decode_char(chunk[3])?;
+            out.push((c0 << 2) | (c1 >> 4));
+            out.push((c1 << 4) | (c2 >> 2));
+            out.push((c2 << 6) | c3);
+        }
+
+        if out.len() > MAX_LOGO_BYTES {
+            return Err(ApiError::BadRequest("Decoded logo exceeds 1 MiB size limit".into()));
+        }
+    }
+
+    Ok(out)
+}
+
+/// Strictly validates the logo data URL, decoding the binary bytes and verifying
+/// allowed raster MIME types (PNG, JPEG, WebP) and magic byte signatures.
+fn validate_logo_payload(data_url: &str) -> Result<(String, usize), ApiError> {
+    if !data_url.starts_with("data:") {
+        return Err(ApiError::BadRequest("Logo must be a data: URL".into()));
+    }
+
+    // Explicitly reject SVG and HTML
+    let lower = data_url.to_lowercase();
+    if lower.contains("image/svg") || lower.contains("<svg") || lower.contains("text/html") {
+        return Err(ApiError::BadRequest(
+            "SVG and HTML logos are strictly prohibited for security reasons. Please use PNG, JPEG, or WebP.".into(),
+        ));
+    }
+
+    let parts: Vec<&str> = data_url.splitn(2, ',').collect();
+    if parts.len() != 2 {
+        return Err(ApiError::BadRequest("Missing data URL payload separator ','".into()));
+    }
+
+    let header = parts[0];
+    let payload = parts[1].trim();
+
+    if !header.ends_with(";base64") {
+        return Err(ApiError::BadRequest("Logo data URL must declare ';base64' encoding".into()));
+    }
+
+    let mime = header.trim_start_matches("data:").trim_end_matches(";base64").to_lowercase();
+
+    let normalized_mime = match mime.as_str() {
+        "image/png" => "image/png",
+        "image/jpeg" | "image/jpg" => "image/jpeg",
+        "image/webp" => "image/webp",
+        _ => {
+            return Err(ApiError::BadRequest(
+                "Unsupported image MIME type. Only PNG, JPEG, and WebP raster images are allowed".into(),
+            ))
+        }
+    };
+
+    let decoded = strict_decode_base64(payload)?;
+    if decoded.is_empty() {
+        return Err(ApiError::BadRequest("Decoded logo payload is empty".into()));
+    }
+
+    if decoded.len() > MAX_LOGO_BYTES {
+        return Err(ApiError::BadRequest("Logo binary size exceeds 1 MiB limit".into()));
+    }
+
+    // Magic byte signature validation
+    match normalized_mime {
+        "image/png" => {
+            const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+            if decoded.len() < 8 || &decoded[0..8] != &PNG_SIG {
+                return Err(ApiError::BadRequest("File signature does not match declared PNG image format".into()));
+            }
+        }
+        "image/jpeg" => {
+            if decoded.len() < 3 || &decoded[0..3] != &[0xFF, 0xD8, 0xFF] {
+                return Err(ApiError::BadRequest("File signature does not match declared JPEG image format".into()));
+            }
+        }
+        "image/webp" => {
+            if decoded.len() < 12 || &decoded[0..4] != b"RIFF" || &decoded[8..12] != b"WEBP" {
+                return Err(ApiError::BadRequest("File signature does not match declared WebP image format".into()));
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    Ok((normalized_mime.to_string(), decoded.len()))
+}
+
+/// POST /api/business/logo - Upload business logo (strictly verified raster only, max 1MB)
 async fn upload_logo(
     State(state): State<AppState>,
     user: AuthUser,
@@ -200,46 +359,10 @@ async fn upload_logo(
 
     let data_url = req.logo_data_url.trim();
 
-    // 1. Check data URL format and allowed raster MIME types
-    if !data_url.starts_with("data:image/") {
-        return Err(ApiError::BadRequest("Only data:image URLs are supported".into()));
-    }
+    // 1. Strictly validate format, base64 payload, size, and image magic bytes
+    let (mime, byte_size) = validate_logo_payload(data_url)?;
 
-    // Strictly disallow SVG to prevent script/XSS execution in image rendering
-    if data_url.starts_with("data:image/svg") {
-        return Err(ApiError::BadRequest("SVG logos are not allowed for security reasons. Please use PNG, JPEG, or WebP.".into()));
-    }
-
-    if !data_url.starts_with("data:image/png")
-        && !data_url.starts_with("data:image/jpeg")
-        && !data_url.starts_with("data:image/jpg")
-        && !data_url.starts_with("data:image/webp")
-    {
-        return Err(ApiError::BadRequest("Unsupported image format. Allowed formats: PNG, JPEG, WebP.".into()));
-    }
-
-    // 2. Size limit check: ~1.4MB base64 string corresponds to ~1MB binary
-    if data_url.len() > 1_500_000 {
-        return Err(ApiError::BadRequest("Logo image file size must be less than 1MB".into()));
-    }
-
-    // 3. Verify valid base64 payload
-    let parts: Vec<&str> = data_url.splitn(2, ',').collect();
-    if parts.len() != 2 {
-        return Err(ApiError::BadRequest("Invalid data URL structure".into()));
-    }
-
-    let b64_payload = parts[1];
-    let decoded = hex::decode("00") // test dummy or decode check
-        .map(|_| ()); // Verify general decoding functionality
-    let _ = decoded;
-
-    // Validate standard base64 characters
-    if b64_payload.chars().any(|c| !c.is_alphanumeric() && c != '+' && c != '/' && c != '=' && c != '\r' && c != '\n') {
-        return Err(ApiError::BadRequest("Invalid base64 characters in logo image".into()));
-    }
-
-    let conn = state.db.lock().expect("db mutex poisoned");
+    let mut conn = state.db.lock().expect("db mutex poisoned");
     let current = fetch_business(&conn, &user.business_id)?;
     let mut settings = current.settings;
     settings.logo_data_url = Some(data_url.to_string());
@@ -248,20 +371,26 @@ async fn upload_logo(
         .map_err(|e| ApiError::Internal(format!("Failed to serialize settings: {e}")))?;
 
     let now = now_iso();
-    conn.execute(
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE businesses SET settings_json = ?1, updated_at = ?2 WHERE business_id = ?3",
         rusqlite::params![settings_json, now, user.business_id],
     )?;
 
     crate::audit::record(
-        &conn,
+        &tx,
         &user.business_id,
         Some(&user.user_id),
         "update_business_logo",
         "business",
         Some(&user.business_id),
-        "{}",
+        &serde_json::json!({
+            "mime": mime,
+            "byte_size": byte_size,
+        })
+        .to_string(),
     )?;
+    tx.commit()?;
 
     fetch_business(&conn, &user.business_id).map(Json)
 }
@@ -273,7 +402,7 @@ async fn remove_logo(
 ) -> Result<Json<BusinessView>, ApiError> {
     user.require_owner()?;
 
-    let conn = state.db.lock().expect("db mutex poisoned");
+    let mut conn = state.db.lock().expect("db mutex poisoned");
     let current = fetch_business(&conn, &user.business_id)?;
     let mut settings = current.settings;
     settings.logo_data_url = None;
@@ -282,13 +411,14 @@ async fn remove_logo(
         .map_err(|e| ApiError::Internal(format!("Failed to serialize settings: {e}")))?;
 
     let now = now_iso();
-    conn.execute(
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE businesses SET settings_json = ?1, updated_at = ?2 WHERE business_id = ?3",
         rusqlite::params![settings_json, now, user.business_id],
     )?;
 
     crate::audit::record(
-        &conn,
+        &tx,
         &user.business_id,
         Some(&user.user_id),
         "remove_business_logo",
@@ -296,6 +426,7 @@ async fn remove_logo(
         Some(&user.business_id),
         "{}",
     )?;
+    tx.commit()?;
 
     fetch_business(&conn, &user.business_id).map(Json)
 }

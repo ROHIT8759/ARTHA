@@ -36,13 +36,12 @@ export default function ThermalReceipt({ sale, business }: ThermalReceiptProps) 
         timeStyle: "short",
       });
 
-  // Calculate tax breakdown
+  // Authoritative tax breakdown from persisted item line records
+  // Identity: taxable = line_total_paise - tax_paise
   const taxSlabs: { [key: number]: { taxable: number; tax: number } } = {};
   for (const item of sale.items) {
-    const units = item.quantity_milli / 1000;
-    const lineSub = Math.round(units * item.unit_price_paise);
-    const taxable = Math.max(0, lineSub - item.discount_paise);
-    const lineTax = Math.round((taxable * item.gst_rate_bps) / 10000);
+    const lineTax = item.tax_paise;
+    const taxable = Math.max(0, item.line_total_paise - lineTax);
 
     if (!taxSlabs[item.gst_rate_bps]) {
       taxSlabs[item.gst_rate_bps] = { taxable: 0, tax: 0 };
@@ -111,7 +110,7 @@ export default function ThermalReceipt({ sale, business }: ThermalReceiptProps) 
       {/* Document Title & Status */}
       <div style={{ textAlign: "center", fontWeight: "bold" }}>
         {isDraft && <span style={{ color: "#b45309" }}>*** DRAFT - NOT A BILL ***</span>}
-        {isVoid && <span style={{ color: "#dc2626" }}>*** VOID - CANCELLED ***</span>}
+        {isVoid && <span style={{ color: "#dc2626" }}>*** VOID - CANCELLED (NO REFUND) ***</span>}
         {!isDraft && !isVoid && <span>*** TAX INVOICE ***</span>}
       </div>
 
@@ -125,7 +124,7 @@ export default function ThermalReceipt({ sale, business }: ThermalReceiptProps) 
         </div>
         <div style={{ display: "flex", justifyContent: "space-between", marginTop: "2px" }}>
           <span>Customer: {sale.customer_name || "Walk-in"}</span>
-          <span>Mode: {sale.payment_method.toUpperCase()}</span>
+          <span>Mode: {sale.payment_method.toUpperCase()}{isVoid && sale.payment_status === "paid" ? " (UNREFUNDED)" : ""}</span>
         </div>
         {sale.customer_phone && (
           <div style={{ marginTop: "1px" }}>

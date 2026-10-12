@@ -239,7 +239,7 @@ async fn test_business_profile_and_settings_workflow() {
     assert_eq!(verify_body["settings"]["phone"], "+91 9876543210");
     assert_eq!(verify_body["settings"]["default_layout"], "thermal");
 
-    // 8. Logo upload validation: reject SVG
+    // 8. Logo upload validation: reject SVG and HTML
     let svg_resp = app
         .clone()
         .oneshot(json_request(
@@ -252,23 +252,183 @@ async fn test_business_profile_and_settings_workflow() {
         .unwrap();
     assert_eq!(svg_resp.status(), StatusCode::BAD_REQUEST);
 
-    // 9. Valid raster logo upload succeeds and persists
-    let valid_logo_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-    let logo_resp = app
+    let html_resp = app
         .clone()
         .oneshot(json_request(
             "POST",
             "/api/business/logo",
             Some(&owner_token),
-            json!({ "logo_data_url": valid_logo_url }),
+            json!({ "logo_data_url": "data:text/html;base64,PGh0bWw+PC9odG1sPg==" }),
         ))
         .await
         .unwrap();
-    assert_eq!(logo_resp.status(), StatusCode::OK);
-    let logo_body = body_json(logo_resp).await;
-    assert_eq!(logo_body["settings"]["logo_data_url"], valid_logo_url);
+    assert_eq!(html_resp.status(), StatusCode::BAD_REQUEST);
 
-    // 10. Logo deletion clears logo safely
+    // 9. Reject unsupported MIME (GIF, BMP, PDF)
+    let gif_resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(gif_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 10. Reject missing data URL separator or missing ';base64'
+    let missing_sep = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png;base64" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_sep.status(), StatusCode::BAD_REQUEST);
+
+    let missing_b64 = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png,12345" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_b64.status(), StatusCode::BAD_REQUEST);
+
+    // 11. Reject empty payload
+    let empty_payload = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png;base64," }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(empty_payload.status(), StatusCode::BAD_REQUEST);
+
+    // 12. Reject invalid base64 (illegal characters, wrong padding)
+    let invalid_b64 = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png;base64,not_valid_base64!!!" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_b64.status(), StatusCode::BAD_REQUEST);
+
+    // 13. Reject signature mismatch (declared PNG, but contains arbitrary non-PNG bytes)
+    let malformed_sig = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png;base64,dGVzdGFzZGY=" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(malformed_sig.status(), StatusCode::BAD_REQUEST);
+
+    // 14. Valid 1x1 PNG upload succeeds and persists
+    let valid_png_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let logo_png_resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": valid_png_url }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(logo_png_resp.status(), StatusCode::OK);
+    let logo_png_body = body_json(logo_png_resp).await;
+    assert_eq!(logo_png_body["settings"]["logo_data_url"], valid_png_url);
+
+    // 15. Verify that a subsequent FAILED upload preserves the existing valid logo unchanged!
+    let failed_upload = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png;base64,corrupted" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(failed_upload.status(), StatusCode::BAD_REQUEST);
+
+    let verify_unchanged = app
+        .clone()
+        .oneshot(json_request("GET", "/api/business", Some(&owner_token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(verify_unchanged.status(), StatusCode::OK);
+    let verify_unchanged_body = body_json(verify_unchanged).await;
+    assert_eq!(verify_unchanged_body["settings"]["logo_data_url"], valid_png_url);
+
+    // 16. Valid minimal JPEG upload succeeds and verifies JPEG magic bytes
+    let valid_jpeg_url = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=";
+    let logo_jpeg_resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": valid_jpeg_url }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(logo_jpeg_resp.status(), StatusCode::OK);
+
+    // 17. Valid minimal WebP upload succeeds and verifies WebP RIFF/WEBP magic bytes
+    let valid_webp_url = "data:image/webp;base64,UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAD8D+JaQAA3AA/ua1AAA=";
+    let logo_webp_resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": valid_webp_url }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(logo_webp_resp.status(), StatusCode::OK);
+
+    // 18. Reject MIME-signature mismatch (declared PNG but contains JPEG bytes)
+    let mismatch_resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mismatch_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 19. Staff cannot delete logo (403)
+    let staff_del_resp = app
+        .clone()
+        .oneshot(json_request("DELETE", "/api/business/logo", Some(&staff_token), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(staff_del_resp.status(), StatusCode::FORBIDDEN);
+
+    // 20. Owner successfully deletes logo (200)
     let del_logo_resp = app
         .clone()
         .oneshot(json_request("DELETE", "/api/business/logo", Some(&owner_token), Value::Null))
@@ -278,7 +438,7 @@ async fn test_business_profile_and_settings_workflow() {
     let del_body = body_json(del_logo_resp).await;
     assert!(del_body["settings"]["logo_data_url"].is_null());
 
-    // 11. Audit log verification
+    // 21. Audit log verification
     {
         let conn = state.db.lock().unwrap();
         let audit_count: i64 = conn
@@ -291,3 +451,4 @@ async fn test_business_profile_and_settings_workflow() {
         assert!(audit_count >= 3);
     }
 }
+

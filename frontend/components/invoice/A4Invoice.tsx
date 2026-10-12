@@ -8,13 +8,6 @@ interface A4InvoiceProps {
   business: BusinessView | null;
 }
 
-interface TaxSlabSummary {
-  rateBps: number;
-  taxablePaise: number;
-  cgstPaise: number;
-  sgstPaise: number;
-  taxPaise: number;
-}
 
 export default function A4Invoice({ sale, business }: A4InvoiceProps) {
   const isVoid = sale.status === "void";
@@ -34,28 +27,22 @@ export default function A4Invoice({ sale, business }: A4InvoiceProps) {
   ].filter(Boolean);
   const formattedAddress = addressParts.join(", ");
 
-  // Compute Tax Slab Breakdown
-  const taxSlabs: { [key: number]: TaxSlabSummary } = {};
+  // Authoritative Tax Slab Breakdown from persisted line records
+  // Derivation identity: line_total_paise = taxable_line + tax_paise
+  // Therefore: taxable_line = line_total_paise - tax_paise (exact integer paise, no float rounding errors)
+  const taxSlabs: { [key: number]: { rateBps: number; taxablePaise: number; taxPaise: number } } = {};
   for (const item of sale.items) {
-    const units = item.quantity_milli / 1000;
-    const lineSub = Math.round(units * item.unit_price_paise);
-    const taxable = Math.max(0, lineSub - item.discount_paise);
-    const lineTax = Math.round((taxable * item.gst_rate_bps) / 10000);
-    const halfTax = Math.round(lineTax / 2);
-    const otherHalf = lineTax - halfTax;
+    const lineTax = item.tax_paise;
+    const taxable = Math.max(0, item.line_total_paise - lineTax);
 
     if (!taxSlabs[item.gst_rate_bps]) {
       taxSlabs[item.gst_rate_bps] = {
         rateBps: item.gst_rate_bps,
         taxablePaise: 0,
-        cgstPaise: 0,
-        sgstPaise: 0,
         taxPaise: 0,
       };
     }
     taxSlabs[item.gst_rate_bps].taxablePaise += taxable;
-    taxSlabs[item.gst_rate_bps].cgstPaise += halfTax;
-    taxSlabs[item.gst_rate_bps].sgstPaise += otherHalf;
     taxSlabs[item.gst_rate_bps].taxPaise += lineTax;
   }
 
@@ -182,7 +169,7 @@ export default function A4Invoice({ sale, business }: A4InvoiceProps) {
             textAlign: "center",
           }}
         >
-          ⚠️ VOID INVOICE: This invoice was cancelled. All associated inventory deductions have been reversed in the ledger.
+          ⚠️ VOID INVOICE: This invoice was cancelled. Associated inventory deductions have been reversed in the ledger. Note: Payment collection remains on record; no automated payment refund has been processed.
         </div>
       )}
 
@@ -316,7 +303,10 @@ export default function A4Invoice({ sale, business }: A4InvoiceProps) {
             Payment Mode: <strong style={{ textTransform: "uppercase" }}>{sale.payment_method}</strong>
           </div>
           <div style={{ fontSize: "0.9rem", color: "#111827", marginTop: "0.2rem" }}>
-            Payment Status: <strong style={{ textTransform: "uppercase" }}>{sale.payment_status}</strong>
+            Payment Status:{" "}
+            <strong style={{ textTransform: "uppercase" }}>
+              {isVoid && sale.payment_status === "paid" ? "PAID (UNREFUNDED)" : sale.payment_status}
+            </strong>
           </div>
           {sale.finalized_by && (
             <div style={{ fontSize: "0.85rem", color: "#6b7280", marginTop: "0.2rem" }}>
@@ -420,11 +410,9 @@ export default function A4Invoice({ sale, business }: A4InvoiceProps) {
             <table style={{ width: "100%", fontSize: "0.8rem", borderCollapse: "collapse" }}>
               <thead>
                 <tr style={{ borderBottom: "1px solid #e5e7eb", background: "#f9fafb" }}>
-                  <th style={{ padding: "0.35rem 0.4rem", textAlign: "left" }}>Rate</th>
-                  <th style={{ padding: "0.35rem 0.4rem", textAlign: "right" }}>Taxable</th>
-                  <th style={{ padding: "0.35rem 0.4rem", textAlign: "right" }}>CGST</th>
-                  <th style={{ padding: "0.35rem 0.4rem", textAlign: "right" }}>SGST</th>
-                  <th style={{ padding: "0.35rem 0.4rem", textAlign: "right" }}>Total Tax</th>
+                  <th style={{ padding: "0.35rem 0.4rem", textAlign: "left" }}>GST Rate</th>
+                  <th style={{ padding: "0.35rem 0.4rem", textAlign: "right" }}>Taxable Amount</th>
+                  <th style={{ padding: "0.35rem 0.4rem", textAlign: "right" }}>Tax Amount (GST)</th>
                 </tr>
               </thead>
               <tbody>
@@ -432,8 +420,6 @@ export default function A4Invoice({ sale, business }: A4InvoiceProps) {
                   <tr key={slab.rateBps} style={{ borderBottom: "1px solid #f3f4f6" }}>
                     <td style={{ padding: "0.35rem 0.4rem", fontWeight: 600 }}>{(slab.rateBps / 100).toFixed(0)}%</td>
                     <td style={{ padding: "0.35rem 0.4rem", textAlign: "right" }}>{formatPaise(slab.taxablePaise)}</td>
-                    <td style={{ padding: "0.35rem 0.4rem", textAlign: "right" }}>{formatPaise(slab.cgstPaise)}</td>
-                    <td style={{ padding: "0.35rem 0.4rem", textAlign: "right" }}>{formatPaise(slab.sgstPaise)}</td>
                     <td style={{ padding: "0.35rem 0.4rem", textAlign: "right", fontWeight: 600 }}>{formatPaise(slab.taxPaise)}</td>
                   </tr>
                 ))}
