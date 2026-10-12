@@ -57,6 +57,7 @@ fn run_migrations(conn: &Connection) -> Result<(), ApiError> {
         (1, include_str!("../migrations/0001_init.sql")),
         (2, include_str!("../migrations/0002_inventory.sql")),
         (3, include_str!("../migrations/0003_purchases_updates.sql")),
+        (4, include_str!("../migrations/0004_sales_updates.sql")),
     ];
 
     for (version, sql) in migrations {
@@ -118,7 +119,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
             .expect("schema_migrations should have at least one row");
-        assert_eq!(version, 1);
+        assert_eq!(version, 4);
 
         // A core table from migration 0001 should exist and be queryable.
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM businesses", [], |r| r.get(0)).unwrap();
@@ -142,7 +143,7 @@ mod tests {
         let conn = open_and_migrate(&path).expect("reopening an existing db should succeed");
 
         let migration_rows: i64 = conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0)).unwrap();
-        assert_eq!(migration_rows, 1, "migration 1 should be recorded exactly once");
+        assert_eq!(migration_rows, 4, "all migrations should be recorded exactly once");
 
         // Pre-existing data survives a reopen (this would also fail loudly
         // if run_migrations ever re-ran the CREATE TABLE statements without
@@ -170,6 +171,6 @@ mod tests {
     fn open_in_memory_is_already_migrated() {
         let conn = open_in_memory();
         let version: i64 = conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 4);
     }
 }

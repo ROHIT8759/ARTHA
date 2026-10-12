@@ -111,3 +111,106 @@ pub struct ProductView {
     pub created_at: String,
     pub updated_at: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaleItemView {
+    pub sale_item_id: String,
+    pub product_id: String,
+    pub product_name_snapshot: String,
+    pub batch_snapshot: Option<String>,
+    pub hsn_code_snapshot: Option<String>,
+    pub gst_rate_bps: i64,
+    pub quantity_milli: i64,
+    pub unit_price_paise: i64,
+    pub discount_paise: i64,
+    pub tax_paise: i64,
+    pub line_total_paise: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentView {
+    pub payment_id: String,
+    pub payment_method: String,
+    pub amount_paise: i64,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaleView {
+    pub sale_id: String,
+    pub business_id: String,
+    pub invoice_no: Option<String>,
+    pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
+    pub customer_email: Option<String>,
+    pub customer_address: Option<String>,
+    pub customer_gstin: Option<String>,
+    pub status: String, // "draft", "completed", "void"
+    pub subtotal_paise: i64,
+    pub discount_paise: i64,
+    pub tax_total_paise: i64,
+    pub grand_total_paise: i64,
+    pub payment_method: String,
+    pub payment_status: String,
+    pub notes: Option<String>,
+    pub created_by: String,
+    pub finalized_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finalized_at: Option<String>,
+    pub items: Vec<SaleItemView>,
+    pub payments: Vec<PaymentView>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSaleRequest {
+    pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
+    pub customer_email: Option<String>,
+    pub customer_address: Option<String>,
+    pub customer_gstin: Option<String>,
+    pub payment_method: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateSaleItemRequest {
+    pub sale_item_id: Option<String>,
+    pub product_id: String,
+    pub quantity_milli: i64,
+    pub unit_price_paise: Option<i64>,
+    pub discount_paise: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateSaleRequest {
+    pub customer_name: Option<String>,
+    pub customer_phone: Option<String>,
+    pub customer_email: Option<String>,
+    pub customer_address: Option<String>,
+    pub customer_gstin: Option<String>,
+    pub payment_method: Option<String>,
+    pub discount_paise: Option<i64>,
+    pub notes: Option<String>,
+    pub items: Option<Vec<UpdateSaleItemRequest>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FinalizeSaleRequest {
+    pub payment_method: Option<String>,
+    pub amount_paise: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VoidSaleRequest {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListSalesQuery {
+    pub status: Option<String>,
+    pub search: Option<String>,
+    pub limit: Option<i64>,
+}
+

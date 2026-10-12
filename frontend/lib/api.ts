@@ -204,7 +204,104 @@ export const api = {
   },
   
   processOcr: (purchaseId: string, imageId: string) => request<{ parsed?: { invoice_no?: string; items?: Array<Record<string, unknown>> }, status: string }>(`/api/purchases/${purchaseId}/ocr`, { method: "POST", body: JSON.stringify({ image_id: imageId }) }),
+
+  // --- SALES & BILLING ---
+  listSales: (query?: { status?: string; search?: string; limit?: number }) => {
+    const params = new URLSearchParams();
+    if (query?.status) params.set("status", query.status);
+    if (query?.search) params.set("search", query.search);
+    if (query?.limit) params.set("limit", query.limit.toString());
+    const qs = params.toString();
+    return request<SaleView[]>(qs ? `/api/sales?${qs}` : "/api/sales");
+  },
+
+  getSale: (saleId: string) => request<SaleView>(`/api/sales/${saleId}`),
+
+  createSale: (body?: {
+    customer_name?: string;
+    customer_phone?: string;
+    customer_email?: string;
+    customer_address?: string;
+    customer_gstin?: string;
+    payment_method?: string;
+    notes?: string;
+  }) => request<SaleView>("/api/sales", { method: "POST", body: JSON.stringify(body || {}) }),
+
+  updateSale: (
+    saleId: string,
+    body: {
+      customer_name?: string;
+      customer_phone?: string;
+      customer_email?: string;
+      customer_address?: string;
+      customer_gstin?: string;
+      payment_method?: string;
+      discount_paise?: number;
+      notes?: string;
+      items?: Array<{
+        sale_item_id?: string;
+        product_id: string;
+        quantity_milli: number;
+        unit_price_paise?: number;
+        discount_paise?: number;
+      }>;
+    }
+  ) => request<SaleView>(`/api/sales/${saleId}`, { method: "PATCH", body: JSON.stringify(body) }),
+
+  finalizeSale: (saleId: string, body?: { payment_method?: string; amount_paise?: number }) =>
+    request<SaleView>(`/api/sales/${saleId}/finalize`, { method: "POST", body: JSON.stringify(body || {}) }),
+
+  voidSale: (saleId: string, reason?: string) =>
+    request<SaleView>(`/api/sales/${saleId}/void`, { method: "POST", body: JSON.stringify({ reason }) }),
 };
+
+export interface SaleItemView {
+  sale_item_id: string;
+  product_id: string;
+  product_name_snapshot: string;
+  batch_snapshot: string | null;
+  hsn_code_snapshot: string | null;
+  gst_rate_bps: number;
+  quantity_milli: number;
+  unit_price_paise: number;
+  discount_paise: number;
+  tax_paise: number;
+  line_total_paise: number;
+}
+
+export interface PaymentView {
+  payment_id: string;
+  payment_method: string;
+  amount_paise: number;
+  status: string;
+  created_at: string;
+}
+
+export interface SaleView {
+  sale_id: string;
+  business_id: string;
+  invoice_no: string | null;
+  customer_name: string | null;
+  customer_phone: string | null;
+  customer_email: string | null;
+  customer_address: string | null;
+  customer_gstin: string | null;
+  status: "draft" | "completed" | "void";
+  subtotal_paise: number;
+  discount_paise: number;
+  tax_total_paise: number;
+  grand_total_paise: number;
+  payment_method: string;
+  payment_status: string;
+  notes: string | null;
+  created_by: string;
+  finalized_by: string | null;
+  created_at: string;
+  updated_at: string;
+  finalized_at: string | null;
+  items: SaleItemView[];
+  payments: PaymentView[];
+}
 
 /** Money is stored/transported as integer paise; this is the only place
  *  that formats it for display, so the rupee symbol and rounding rule
