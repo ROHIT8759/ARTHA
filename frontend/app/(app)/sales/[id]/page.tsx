@@ -3,9 +3,11 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { api, SaleView, ProductView, formatPaise } from "@/lib/api";
+import { api, SaleView, ProductView, BusinessView, formatPaise } from "@/lib/api";
 import LoadingState from "@/components/ui/LoadingState";
 import ErrorState from "@/components/ui/ErrorState";
+import A4Invoice from "@/components/invoice/A4Invoice";
+import ThermalReceipt from "@/components/invoice/ThermalReceipt";
 
 interface CartLine {
   sale_item_id?: string;
@@ -26,6 +28,9 @@ export default function SaleDetailPage() {
   const router = useRouter();
 
   const [sale, setSale] = useState<SaleView | null>(null);
+  const [business, setBusiness] = useState<BusinessView | null>(null);
+  const [layoutFormat, setLayoutFormat] = useState<"a4" | "thermal">("a4");
+  const [previewDraft, setPreviewDraft] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -53,25 +58,36 @@ export default function SaleDetailPage() {
 
   const qrInputRef = useRef<HTMLInputElement>(null);
 
-  // Load sale data
+  // Load sale data and business profile
   useEffect(() => {
     let mounted = true;
-    const fetchSale = async () => {
+    const fetchData = async () => {
       try {
         setLoading(true);
-        const data = await api.getSale(saleId);
-        if (mounted) {
-          setSale(data);
-          setCustomerName(data.customer_name || "");
-          setCustomerPhone(data.customer_phone || "");
-          setCustomerGstin(data.customer_gstin || "");
-          setPaymentMethod(data.payment_method || "cash");
-          setBillDiscountPaise(data.discount_paise || 0);
-          setNotes(data.notes || "");
+        const [saleData, businessData] = await Promise.all([
+          api.getSale(saleId),
+          api.getBusiness().catch(() => null),
+        ]);
 
-          if (data.status === "draft") {
+        if (mounted) {
+          setSale(saleData);
+          if (businessData) {
+            setBusiness(businessData);
+            if (businessData.settings?.default_layout === "thermal") {
+              setLayoutFormat("thermal");
+            }
+          }
+
+          setCustomerName(saleData.customer_name || "");
+          setCustomerPhone(saleData.customer_phone || "");
+          setCustomerGstin(saleData.customer_gstin || "");
+          setPaymentMethod(saleData.payment_method || "cash");
+          setBillDiscountPaise(saleData.discount_paise || 0);
+          setNotes(saleData.notes || "");
+
+          if (saleData.status === "draft") {
             setCart(
-              data.items.map((i) => ({
+              saleData.items.map((i) => ({
                 sale_item_id: i.sale_item_id,
                 product_id: i.product_id,
                 product_name_snapshot: i.product_name_snapshot,
@@ -97,7 +113,7 @@ export default function SaleDetailPage() {
       }
     };
 
-    fetchSale();
+    fetchData();
     return () => {
       mounted = false;
     };
@@ -335,34 +351,146 @@ export default function SaleDetailPage() {
   if (!sale) return null;
 
   // ==========================================
-  // INVOICE / COMPLETED VIEW (Print-Friendly)
+  // DOCUMENT VIEW (A4 Tax Invoice & Thermal POS)
   // ==========================================
-  if (sale.status === "completed" || sale.status === "void") {
+  if (sale.status === "completed" || sale.status === "void" || previewDraft) {
     const isVoid = sale.status === "void";
+    const isDraft = sale.status === "draft";
+
+    // Reactive sale snapshot for proforma draft preview
+    const effectiveSale: SaleView =
+      isDraft && previewDraft
+        ? {
+            ...sale,
+            customer_name: customerName,
+            customer_phone: customerPhone,
+            customer_gstin: customerGstin,
+            payment_method: paymentMethod,
+            subtotal_paise: calculatedSubtotal,
+            discount_paise: totalCalculatedDiscount,
+            tax_total_paise: calculatedTax,
+            grand_total_paise: calculatedGrandTotal,
+            items: cart.map((c, i) => {
+              const lineSub = Math.round((c.quantity_milli / 1000) * c.unit_price_paise);
+              const taxable = Math.max(0, lineSub - c.discount_paise);
+              const lineTax = Math.round((taxable * c.gst_rate_bps) / 10000);
+              return {
+                sale_item_id: c.sale_item_id || `draft-item-${i}`,
+                sale_id: sale.sale_id,
+                product_id: c.product_id,
+                product_name_snapshot: c.product_name_snapshot,
+                batch_snapshot: c.batch_snapshot || null,
+                hsn_code_snapshot: c.hsn_code_snapshot || null,
+                gst_rate_bps: c.gst_rate_bps,
+                quantity_milli: c.quantity_milli,
+                unit_price_paise: c.unit_price_paise,
+                discount_paise: c.discount_paise,
+                tax_paise: lineTax,
+                line_total_paise: taxable + lineTax,
+              };
+            }),
+          }
+        : sale;
 
     return (
-      <div style={{ maxWidth: 800, margin: "0 auto" }}>
+      <div style={{ maxWidth: layoutFormat === "thermal" ? 420 : 880, margin: "0 auto", paddingBottom: "3rem" }}>
         {/* Screen-only Action Toolbar */}
-        <div className="no-print" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1.5rem" }}>
-          <Link href="/sales" className="btn btn-secondary">
-            &larr; Back to Sales
-          </Link>
-          <div style={{ display: "flex", gap: "0.75rem" }}>
+        <div
+          className="no-print"
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "1rem",
+            marginBottom: "1.5rem",
+            padding: "1rem",
+            backgroundColor: "var(--background)",
+            borderRadius: "8px",
+            border: "1px solid var(--border)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+            {isDraft ? (
+              <button
+                onClick={() => setPreviewDraft(false)}
+                className="btn btn-secondary"
+                style={{ fontWeight: 600 }}
+              >
+                &larr; Back to Checkout
+              </button>
+            ) : (
+              <Link href="/sales" className="btn btn-secondary" style={{ fontWeight: 600 }}>
+                &larr; Back to Sales
+              </Link>
+            )}
+
+            {/* Layout switch controls */}
+            <div style={{ display: "inline-flex", border: "1px solid var(--border)", borderRadius: "6px", overflow: "hidden" }}>
+              <button
+                type="button"
+                onClick={() => setLayoutFormat("a4")}
+                style={{
+                  padding: "0.45rem 0.85rem",
+                  fontSize: "0.85rem",
+                  border: "none",
+                  cursor: "pointer",
+                  fontWeight: 600,
+                  backgroundColor: layoutFormat === "a4" ? "var(--accent)" : "transparent",
+                  color: layoutFormat === "a4" ? "#fff" : "var(--foreground)",
+                }}
+              >
+                📄 A4 Tax Invoice
+              </button>
+              <button
+                type="button"
+                onClick={() => setLayoutFormat("thermal")}
+                style={{
+                  padding: "0.45rem 0.85rem",
+                  fontSize: "0.85rem",
+                  border: "none",
+                  cursor: "pointer",
+                  fontWeight: 600,
+                  backgroundColor: layoutFormat === "thermal" ? "var(--accent)" : "transparent",
+                  color: layoutFormat === "thermal" ? "#fff" : "var(--foreground)",
+                }}
+              >
+                🧾 Thermal Receipt (80mm)
+              </button>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
             <button
               onClick={() => window.print()}
               className="btn"
               style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}
             >
-              🖨️ Print Invoice
+              🖨️ Print Document
             </button>
-            <button
-              onClick={() => router.push("/sales/new")}
-              className="btn"
-              style={{ background: "#2563eb", color: "#fff" }}
-            >
-              ⚡ New Sale
-            </button>
-            {!isVoid && (
+
+            {isDraft && (
+              <button
+                onClick={handleFinalize}
+                disabled={finalizing || cart.length === 0}
+                className="btn"
+                style={{ background: "#2563eb", color: "#fff" }}
+              >
+                {finalizing ? "Finalizing..." : `⚡ Finalize & Bill ${formatPaise(calculatedGrandTotal)}`}
+              </button>
+            )}
+
+            {!isDraft && (
+              <button
+                onClick={() => router.push("/sales/new")}
+                className="btn"
+                style={{ background: "#2563eb", color: "#fff" }}
+              >
+                ⚡ New Sale
+              </button>
+            )}
+
+            {!isVoid && !isDraft && (
               <button
                 onClick={handleVoid}
                 disabled={voiding}
@@ -377,182 +505,16 @@ export default function SaleDetailPage() {
 
         {actionError && (
           <div className="card no-print" style={{ marginBottom: "1rem", borderColor: "var(--danger)", backgroundColor: "rgba(179, 38, 30, 0.05)" }}>
-            <p style={{ color: "var(--danger)", margin: 0 }}>{actionError}</p>
+            <p style={{ color: "var(--danger)", margin: 0, fontWeight: 600 }}>{actionError}</p>
           </div>
         )}
 
-        {isVoid && (
-          <div className="card" style={{ marginBottom: "1.5rem", borderColor: "var(--danger)", backgroundColor: "rgba(179, 38, 30, 0.08)", textAlign: "center" }}>
-            <h2 style={{ color: "var(--danger)", margin: "0 0 0.5rem" }}>⚠️ VOID INVOICE</h2>
-            <p className="muted" style={{ margin: 0 }}>This invoice has been voided. All associated stock deductions have been reversed in the ledger.</p>
-          </div>
+        {/* Render Layout */}
+        {layoutFormat === "a4" ? (
+          <A4Invoice sale={effectiveSale} business={business} />
+        ) : (
+          <ThermalReceipt sale={effectiveSale} business={business} />
         )}
-
-        {/* Printable Invoice Container */}
-        <div
-          className="card invoice-container"
-          style={{
-            backgroundColor: "var(--background)",
-            padding: "2.5rem",
-            boxShadow: "0 2px 10px rgba(0,0,0,0.05)",
-          }}
-        >
-          {/* Header */}
-          <div style={{ display: "flex", justifyContent: "space-between", borderBottom: "2px solid var(--border)", paddingBottom: "1.5rem", marginBottom: "1.5rem" }}>
-            <div>
-              <h1 style={{ margin: "0 0 0.25rem", fontSize: "1.8rem", letterSpacing: "1px" }}>TAX INVOICE</h1>
-              <p className="muted" style={{ margin: 0, fontWeight: 500 }}>ARTHA RETAIL SYSTEM</p>
-              <p className="muted" style={{ margin: 0, fontSize: "0.85rem" }}>Local Authoritative Billing & Inventory</p>
-            </div>
-            <div style={{ textAlign: "right" }}>
-              <div style={{ fontSize: "1.2rem", fontWeight: 700, fontFamily: "monospace" }}>
-                {sale.invoice_no || "DRAFT"}
-              </div>
-              <p className="muted" style={{ margin: "0.25rem 0 0", fontSize: "0.9rem" }}>
-                Date: {sale.finalized_at ? new Date(sale.finalized_at).toLocaleString() : new Date(sale.created_at).toLocaleString()}
-              </p>
-              <div style={{ marginTop: "0.5rem" }}>
-                <span
-                  style={{
-                    display: "inline-block",
-                    padding: "0.2rem 0.6rem",
-                    borderRadius: "4px",
-                    fontSize: "0.8rem",
-                    fontWeight: 700,
-                    textTransform: "uppercase",
-                    backgroundColor: isVoid ? "rgba(179,38,30,0.15)" : "rgba(15,107,76,0.15)",
-                    color: isVoid ? "var(--danger)" : "var(--accent)",
-                  }}
-                >
-                  {isVoid ? "VOID" : "PAID"}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Customer Metadata */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1.5rem", marginBottom: "1.5rem", paddingBottom: "1.5rem", borderBottom: "1px solid var(--border)" }}>
-            <div>
-              <div className="muted" style={{ fontSize: "0.8rem", textTransform: "uppercase", fontWeight: 600, marginBottom: "0.25rem" }}>Billed To</div>
-              <div style={{ fontWeight: 600 }}>{sale.customer_name || "Walk-in Customer"}</div>
-              {sale.customer_phone && <div className="muted" style={{ fontSize: "0.9rem" }}>Phone: {sale.customer_phone}</div>}
-              {sale.customer_email && <div className="muted" style={{ fontSize: "0.9rem" }}>Email: {sale.customer_email}</div>}
-              {sale.customer_address && <div className="muted" style={{ fontSize: "0.9rem" }}>{sale.customer_address}</div>}
-              {sale.customer_gstin && <div className="muted" style={{ fontSize: "0.9rem" }}>GSTIN: {sale.customer_gstin}</div>}
-            </div>
-            <div style={{ textAlign: "right" }}>
-              <div className="muted" style={{ fontSize: "0.8rem", textTransform: "uppercase", fontWeight: 600, marginBottom: "0.25rem" }}>Payment Details</div>
-              <div>Mode: <strong style={{ textTransform: "uppercase" }}>{sale.payment_method}</strong></div>
-              <div>Status: <strong>{sale.payment_status.toUpperCase()}</strong></div>
-              {sale.payments.length > 0 && (
-                <div className="muted" style={{ fontSize: "0.85rem", marginTop: "0.25rem" }}>
-                  Ref: {sale.payments[0].payment_id.slice(0, 8)}...
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Line Items Table */}
-          <table style={{ width: "100%", marginBottom: "1.5rem" }}>
-            <thead>
-              <tr style={{ borderBottom: "2px solid var(--border)", background: "rgba(0,0,0,0.02)" }}>
-                <th style={{ padding: "0.6rem", width: "40px" }}>#</th>
-                <th style={{ padding: "0.6rem" }}>Item Description</th>
-                <th style={{ padding: "0.6rem", textAlign: "right" }}>Qty</th>
-                <th style={{ padding: "0.6rem", textAlign: "right" }}>Rate</th>
-                <th style={{ padding: "0.6rem", textAlign: "right" }}>Disc</th>
-                <th style={{ padding: "0.6rem", textAlign: "right" }}>GST</th>
-                <th style={{ padding: "0.6rem", textAlign: "right" }}>Total</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sale.items.map((item, idx) => (
-                <tr key={item.sale_item_id} style={{ borderBottom: "1px solid var(--border)" }}>
-                  <td style={{ padding: "0.6rem", color: "var(--muted)" }}>{idx + 1}</td>
-                  <td style={{ padding: "0.6rem" }}>
-                    <div style={{ fontWeight: 600 }}>{item.product_name_snapshot}</div>
-                    <div className="muted" style={{ fontSize: "0.8rem" }}>
-                      {item.hsn_code_snapshot ? `HSN: ${item.hsn_code_snapshot}` : ""}
-                      {item.batch_snapshot ? ` | Batch: ${item.batch_snapshot}` : ""}
-                    </div>
-                  </td>
-                  <td style={{ padding: "0.6rem", textAlign: "right" }}>
-                    {(item.quantity_milli / 1000).toFixed(item.quantity_milli % 1000 === 0 ? 0 : 2)}
-                  </td>
-                  <td style={{ padding: "0.6rem", textAlign: "right" }}>{formatPaise(item.unit_price_paise)}</td>
-                  <td style={{ padding: "0.6rem", textAlign: "right" }}>
-                    {item.discount_paise > 0 ? formatPaise(item.discount_paise) : "—"}
-                  </td>
-                  <td style={{ padding: "0.6rem", textAlign: "right" }}>{(item.gst_rate_bps / 100).toFixed(0)}%</td>
-                  <td style={{ padding: "0.6rem", textAlign: "right", fontWeight: 600 }}>
-                    {formatPaise(item.line_total_paise)}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-
-          {/* Financial Totals */}
-          <div style={{ display: "flex", justifyContent: "flex-end" }}>
-            <div style={{ width: 300 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", padding: "0.35rem 0" }}>
-                <span className="muted">Subtotal:</span>
-                <span>{formatPaise(sale.subtotal_paise)}</span>
-              </div>
-              {sale.discount_paise > 0 && (
-                <div style={{ display: "flex", justifyContent: "space-between", padding: "0.35rem 0", color: "var(--accent)" }}>
-                  <span>Discount:</span>
-                  <span>- {formatPaise(sale.discount_paise)}</span>
-                </div>
-              )}
-              <div style={{ display: "flex", justifyContent: "space-between", padding: "0.35rem 0" }}>
-                <span className="muted">Taxes (GST):</span>
-                <span>{formatPaise(sale.tax_total_paise)}</span>
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  padding: "0.75rem 0",
-                  borderTop: "2px solid var(--border)",
-                  marginTop: "0.5rem",
-                  fontSize: "1.2rem",
-                  fontWeight: 700,
-                }}
-              >
-                <span>Grand Total:</span>
-                <span>{formatPaise(sale.grand_total_paise)}</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Footer */}
-          <div style={{ marginTop: "3rem", paddingTop: "1.5rem", borderTop: "1px dashed var(--border)", textAlign: "center" }}>
-            <p className="muted" style={{ margin: 0, fontSize: "0.85rem" }}>
-              Thank you for your business! This is a computer generated invoice.
-            </p>
-          </div>
-        </div>
-
-        {/* Global Print Styling */}
-        <style jsx global>{`
-          @media print {
-            body {
-              background: #fff !important;
-              color: #000 !important;
-            }
-            .no-print, header, nav, aside {
-              display: none !important;
-            }
-            .invoice-container {
-              border: none !important;
-              box-shadow: none !important;
-              padding: 0 !important;
-              width: 100% !important;
-              max-width: 100% !important;
-            }
-          }
-        `}</style>
       </div>
     );
   }
@@ -571,7 +533,15 @@ export default function SaleDetailPage() {
           <h1 style={{ margin: 0 }}>POS Checkout Terminal</h1>
           <p className="muted" style={{ margin: "0.2rem 0 0" }}>Fast barcode/QR scanner or manual search</p>
         </div>
-        <div style={{ display: "flex", gap: "0.75rem" }}>
+        <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+          <button
+            type="button"
+            onClick={() => setPreviewDraft(true)}
+            className="btn btn-secondary"
+            style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}
+          >
+            👁️ Preview / Print Proforma
+          </button>
           <button
             onClick={handleSaveDraft}
             disabled={saving || finalizing}

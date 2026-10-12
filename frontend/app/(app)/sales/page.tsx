@@ -224,7 +224,7 @@ export default function SalesPage() {
                         className="btn btn-secondary"
                         style={{ padding: "0.3rem 0.7rem", fontSize: "0.85rem" }}
                       >
-                        {sale.status === "draft" ? "Edit Draft" : "View Bill"}
+                        {sale.status === "draft" ? "Edit Draft" : "View & Print"}
                       </Link>
                     </td>
                   </tr>

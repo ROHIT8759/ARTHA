@@ -214,3 +214,58 @@ pub struct ListSalesQuery {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BusinessSettingsView {
+    pub registered_name: Option<String>,
+    pub address: Option<String>,
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub pincode: Option<String>,
+    pub country: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+    pub gstin: Option<String>,
+    pub logo_data_url: Option<String>,
+    pub invoice_footer: Option<String>,
+    pub terms_and_conditions: Option<String>,
+    pub default_layout: Option<String>,
+    pub show_hsn: Option<bool>,
+    pub show_tax_breakdown: Option<bool>,
+    pub show_logo: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusinessView {
+    pub business_id: String,
+    pub name: String,
+    pub settings: BusinessSettingsView,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateBusinessRequest {
+    pub name: Option<String>,
+    pub registered_name: Option<String>,
+    pub address: Option<String>,
+    pub city: Option<String>,
+    pub state: Option<String>,
+    pub pincode: Option<String>,
+    pub country: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+    pub gstin: Option<String>,
+    pub invoice_footer: Option<String>,
+    pub terms_and_conditions: Option<String>,
+    pub default_layout: Option<String>,
+    pub show_hsn: Option<bool>,
+    pub show_tax_breakdown: Option<bool>,
+    pub show_logo: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UploadLogoRequest {
+    pub logo_data_url: String,
+}
+
+

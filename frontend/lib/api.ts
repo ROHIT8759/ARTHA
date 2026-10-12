@@ -253,6 +253,34 @@ export const api = {
 
   voidSale: (saleId: string, reason?: string) =>
     request<SaleView>(`/api/sales/${saleId}/void`, { method: "POST", body: JSON.stringify({ reason }) }),
+
+  // --- BUSINESS SETTINGS & PROFILE ---
+  getBusiness: () => request<BusinessView>("/api/business"),
+
+  updateBusiness: (body: {
+    name?: string;
+    registered_name?: string;
+    address?: string;
+    city?: string;
+    state?: string;
+    pincode?: string;
+    country?: string;
+    phone?: string;
+    email?: string;
+    gstin?: string;
+    invoice_footer?: string;
+    terms_and_conditions?: string;
+    default_layout?: "a4" | "thermal";
+    show_hsn?: boolean;
+    show_tax_breakdown?: boolean;
+    show_logo?: boolean;
+  }) => request<BusinessView>("/api/business", { method: "PATCH", body: JSON.stringify(body) }),
+
+  uploadLogo: (logoDataUrl: string) =>
+    request<BusinessView>("/api/business/logo", { method: "POST", body: JSON.stringify({ logo_data_url: logoDataUrl }) }),
+
+  removeLogo: () =>
+    request<BusinessView>("/api/business/logo", { method: "DELETE" }),
 };
 
 export interface SaleItemView {
@@ -303,9 +331,122 @@ export interface SaleView {
   payments: PaymentView[];
 }
 
-/** Money is stored/transported as integer paise; this is the only place
- *  that formats it for display, so the rupee symbol and rounding rule
- *  live in exactly one spot. */
+export interface BusinessSettingsView {
+  registered_name?: string | null;
+  address?: string | null;
+  city?: string | null;
+  state?: string | null;
+  pincode?: string | null;
+  country?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  gstin?: string | null;
+  logo_data_url?: string | null;
+  invoice_footer?: string | null;
+  terms_and_conditions?: string | null;
+  default_layout?: "a4" | "thermal" | null;
+  show_hsn?: boolean | null;
+  show_tax_breakdown?: boolean | null;
+  show_logo?: boolean | null;
+}
+
+export interface BusinessView {
+  business_id: string;
+  name: string;
+  settings: BusinessSettingsView;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Formats integer paise with Indian numbering grouping (e.g. ₹1,23,456.78) */
 export function formatPaise(paise: number): string {
-  return `₹${(paise / 100).toFixed(2)}`;
+  const isNegative = paise < 0;
+  const absPaise = Math.abs(paise);
+  const rupees = Math.floor(absPaise / 100);
+  const remPaise = absPaise % 100;
+  const paiseStr = remPaise.toString().padStart(2, "0");
+
+  const s = rupees.toString();
+  let result = "";
+  if (s.length <= 3) {
+    result = s;
+  } else {
+    const last3 = s.slice(-3);
+    const rest = s.slice(0, -3);
+    const parts = [];
+    for (let i = rest.length; i > 0; i -= 2) {
+      parts.unshift(rest.slice(Math.max(0, i - 2), i));
+    }
+    result = parts.join(",") + "," + last3;
+  }
+
+  return `${isNegative ? "-" : ""}₹${result}.${paiseStr}`;
+}
+
+const ONES = [
+  "", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine",
+  "Ten", "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen",
+  "Seventeen", "Eighteen", "Nineteen",
+];
+const TENS = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"];
+
+function numToWordsUnder1000(n: number): string {
+  let str = "";
+  if (n >= 100) {
+    str += ONES[Math.floor(n / 100)] + " Hundred ";
+    n %= 100;
+  }
+  if (n >= 20) {
+    str += TENS[Math.floor(n / 10)] + " ";
+    n %= 10;
+  }
+  if (n > 0) {
+    str += ONES[n] + " ";
+  }
+  return str.trim();
+}
+
+/** Converts integer paise to Indian English words deterministically */
+export function amountToWords(paise: number): string {
+  if (paise === 0) return "Rupees Zero Only";
+  const absPaise = Math.abs(paise);
+  let rupees = Math.floor(absPaise / 100);
+  const remPaise = absPaise % 100;
+
+  let words = "";
+
+  if (rupees > 0) {
+    const crore = Math.floor(rupees / 10000000);
+    rupees %= 10000000;
+    const lakh = Math.floor(rupees / 100000);
+    rupees %= 100000;
+    const thousand = Math.floor(rupees / 1000);
+    rupees %= 1000;
+    const remainder = rupees;
+
+    if (crore > 0) {
+      words += numToWordsUnder1000(crore) + " Crore ";
+    }
+    if (lakh > 0) {
+      words += numToWordsUnder1000(lakh) + " Lakh ";
+    }
+    if (thousand > 0) {
+      words += numToWordsUnder1000(thousand) + " Thousand ";
+    }
+    if (remainder > 0) {
+      words += numToWordsUnder1000(remainder) + " ";
+    }
+    words = "Rupees " + words.trim();
+  }
+
+  if (remPaise > 0) {
+    const paiseWords = numToWordsUnder1000(remPaise) + " Paise";
+    if (words.length > 0) {
+      words += " and " + paiseWords;
+    } else {
+      words = paiseWords;
+    }
+  }
+
+  return (paise < 0 ? "Minus " : "") + words.trim() + " Only";
 }
