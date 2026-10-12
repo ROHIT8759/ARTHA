@@ -97,7 +97,10 @@ mod tests {
     fn temp_db_path(label: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("artha_db_test_{label}_{}_{n}.db", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "artha_db_test_{label}_{}_{n}.db",
+            std::process::id()
+        ))
     }
 
     struct TempFile(std::path::PathBuf);
@@ -117,12 +120,16 @@ mod tests {
         let conn = open_and_migrate(&path).expect("open_and_migrate should succeed");
 
         let version: i64 = conn
-            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
             .expect("schema_migrations should have at least one row");
         assert_eq!(version, 4);
 
         // A core table from migration 0001 should exist and be queryable.
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM businesses", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM businesses", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -142,13 +149,20 @@ mod tests {
 
         let conn = open_and_migrate(&path).expect("reopening an existing db should succeed");
 
-        let migration_rows: i64 = conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0)).unwrap();
-        assert_eq!(migration_rows, 4, "all migrations should be recorded exactly once");
+        let migration_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            migration_rows, 4,
+            "all migrations should be recorded exactly once"
+        );
 
         // Pre-existing data survives a reopen (this would also fail loudly
         // if run_migrations ever re-ran the CREATE TABLE statements without
         // IF NOT EXISTS and wiped the table).
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM businesses", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM businesses", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -170,7 +184,11 @@ mod tests {
     #[test]
     fn open_in_memory_is_already_migrated() {
         let conn = open_in_memory();
-        let version: i64 = conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0)).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(version, 4);
     }
 }

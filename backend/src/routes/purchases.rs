@@ -1,5 +1,5 @@
-use axum::extract::{Path, State, Multipart};
-use axum::routing::{get, post, patch};
+use axum::extract::{Multipart, Path, State};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -12,10 +12,11 @@ use crate::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/purchases", get(list_purchases))
-        .route("/api/purchases", post(create_purchase))
-        .route("/api/purchases/:id", get(get_purchase))
-        .route("/api/purchases/:id", patch(update_purchase))
+        .route("/api/purchases", get(list_purchases).post(create_purchase))
+        .route(
+            "/api/purchases/:id",
+            get(get_purchase).patch(update_purchase),
+        )
         .route("/api/purchases/:id/approve", post(approve_purchase))
         .route("/api/purchases/:id/cancel", post(cancel_purchase))
         .route("/api/purchases/:id/image", post(upload_bill_image))
@@ -81,7 +82,7 @@ async fn list_purchases(
     user: AuthUser,
 ) -> Result<Json<Vec<PurchaseView>>, ApiError> {
     let conn = state.db.lock().expect("db mutex poisoned");
-    
+
     // Simple list without items to save bandwidth
     let mut stmt = conn.prepare("SELECT purchase_id, supplier_id, invoice_no, invoice_date, status, source, subtotal_paise, tax_total_paise, total_paise, created_by, created_at FROM purchases WHERE business_id = ?1 ORDER BY created_at DESC")?;
     let rows = stmt.query_map(rusqlite::params![user.business_id], |r| {
@@ -105,7 +106,7 @@ async fn list_purchases(
     for row in rows {
         out.push(row?);
     }
-    
+
     Ok(Json(out))
 }
 
@@ -115,7 +116,7 @@ async fn get_purchase(
     Path(id): Path<String>,
 ) -> Result<Json<PurchaseView>, ApiError> {
     let conn = state.db.lock().expect("db mutex poisoned");
-    
+
     let mut view = conn.query_row(
         "SELECT purchase_id, supplier_id, invoice_no, invoice_date, status, source, subtotal_paise, tax_total_paise, total_paise, created_by, created_at FROM purchases WHERE business_id = ?1 AND purchase_id = ?2",
         rusqlite::params![user.business_id, id],
@@ -199,55 +200,64 @@ async fn update_purchase(
     Path(id): Path<String>,
     Json(req): Json<UpdatePurchaseRequest>,
 ) -> Result<Json<PurchaseView>, ApiError> {
-    let mut conn = state.db.lock().expect("db mutex poisoned");
-    let tx = conn.transaction()?;
+    {
+        let mut conn = state.db.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
 
-    let status: String = tx.query_row(
-        "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
-        rusqlite::params![id, user.business_id],
-        |r| r.get(0)
-    ).map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
+        let status: String = tx
+            .query_row(
+                "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
+                rusqlite::params![id, user.business_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
 
-    if status != "draft" {
-        return Err(ApiError::Forbidden("Only draft purchases can be edited".into()));
-    }
-
-    // Process items & recalculate totals server-side
-    tx.execute("DELETE FROM purchase_items WHERE purchase_id = ?1", rusqlite::params![id])?;
-
-    let mut subtotal: i64 = 0;
-    let mut tax_total: i64 = 0;
-
-    for item in req.items {
-        if item.quantity_milli <= 0 {
-            return Err(ApiError::BadRequest("Quantity must be positive".into()));
+        if status != "draft" {
+            return Err(ApiError::Forbidden(
+                "Only draft purchases can be edited".into(),
+            ));
         }
-        
-        let item_id = item.purchase_item_id.unwrap_or_else(new_id);
-        let line_total = (item.quantity_milli as f64 / 1000.0 * item.price_paise as f64).round() as i64;
-        let line_tax = (line_total as f64 * item.gst_rate_bps as f64 / 10000.0).round() as i64;
 
-        subtotal += line_total;
-        tax_total += line_tax;
+        // Process items & recalculate totals server-side
+        tx.execute(
+            "DELETE FROM purchase_items WHERE purchase_id = ?1",
+            rusqlite::params![id],
+        )?;
+
+        let mut subtotal: i64 = 0;
+        let mut tax_total: i64 = 0;
+
+        for item in req.items {
+            if item.quantity_milli <= 0 {
+                return Err(ApiError::BadRequest("Quantity must be positive".into()));
+            }
+
+            let item_id = item.purchase_item_id.unwrap_or_else(new_id);
+            let line_total =
+                (item.quantity_milli as f64 / 1000.0 * item.price_paise as f64).round() as i64;
+            let line_tax = (line_total as f64 * item.gst_rate_bps as f64 / 10000.0).round() as i64;
+
+            subtotal += line_total;
+            tax_total += line_tax;
+
+            tx.execute(
+                "INSERT INTO purchase_items (purchase_item_id, purchase_id, product_id, product_name_snapshot, batch, hsn_code, gst_rate_bps, quantity_milli, price_paise, line_total_paise) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![item_id, id, item.product_id, item.product_name_snapshot, item.batch, item.hsn_code, item.gst_rate_bps, item.quantity_milli, item.price_paise, line_total]
+            )?;
+        }
+
+        let grand_total = subtotal + tax_total;
+        let now = now_iso();
 
         tx.execute(
-            "INSERT INTO purchase_items (purchase_item_id, purchase_id, product_id, product_name_snapshot, batch, hsn_code, gst_rate_bps, quantity_milli, price_paise, line_total_paise) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![item_id, id, item.product_id, item.product_name_snapshot, item.batch, item.hsn_code, item.gst_rate_bps, item.quantity_milli, item.price_paise, line_total]
+            "UPDATE purchases SET supplier_id = ?1, invoice_no = ?2, invoice_date = ?3, subtotal_paise = ?4, tax_total_paise = ?5, total_paise = ?6, updated_at = ?7 WHERE purchase_id = ?8",
+            rusqlite::params![req.supplier_id, req.invoice_no, req.invoice_date, subtotal, tax_total, grand_total, now, id]
         )?;
+
+        tx.commit()?;
     }
 
-    let grand_total = subtotal + tax_total;
-    let now = now_iso();
-
-    tx.execute(
-        "UPDATE purchases SET supplier_id = ?1, invoice_no = ?2, invoice_date = ?3, subtotal_paise = ?4, tax_total_paise = ?5, total_paise = ?6, updated_at = ?7 WHERE purchase_id = ?8",
-        rusqlite::params![req.supplier_id, req.invoice_no, req.invoice_date, subtotal, tax_total, grand_total, now, id]
-    )?;
-
-    tx.commit()?;
-
     // Redirect to get_purchase to return full nested object safely without duplicating logic
-    drop(conn);
     get_purchase(State(state), user, Path(id)).await
 }
 
@@ -259,11 +269,13 @@ async fn approve_purchase(
     let mut conn = state.db.lock().expect("db mutex poisoned");
     let tx = conn.transaction()?;
 
-    let status: String = tx.query_row(
-        "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
-        rusqlite::params![id, user.business_id],
-        |r| r.get(0)
-    ).map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
+    let status: String = tx
+        .query_row(
+            "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
+            rusqlite::params![id, user.business_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
 
     if status != "draft" {
         return Err(ApiError::Conflict("Purchase is already processed".into()));
@@ -273,18 +285,24 @@ async fn approve_purchase(
     let unresolved: i64 = tx.query_row(
         "SELECT COUNT(*) FROM purchase_items WHERE purchase_id = ?1 AND product_id IS NULL",
         rusqlite::params![id],
-        |r| r.get(0)
+        |r| r.get(0),
     )?;
 
     if unresolved > 0 {
-        return Err(ApiError::BadRequest("All products must be matched before approval".into()));
+        return Err(ApiError::BadRequest(
+            "All products must be matched before approval".into(),
+        ));
     }
 
     // Integrate with Inventory
-    let mut stmt = tx.prepare("SELECT product_id, quantity_milli FROM purchase_items WHERE purchase_id = ?1")?;
-    let items = stmt.query_map(rusqlite::params![id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-    })?.collect::<Result<Vec<_>, _>>()?;
+    let mut stmt =
+        tx.prepare("SELECT product_id, quantity_milli FROM purchase_items WHERE purchase_id = ?1")?;
+    let items = stmt
+        .query_map(rusqlite::params![id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
 
     let now = now_iso();
 
@@ -316,7 +334,15 @@ async fn approve_purchase(
         rusqlite::params![now, id]
     )?;
 
-    crate::audit::record(&tx, &user.business_id, Some(&user.user_id), "purchase_approved", "purchase", Some(&id), "{}")?;
+    crate::audit::record(
+        &tx,
+        &user.business_id,
+        Some(&user.user_id),
+        "purchase_approved",
+        "purchase",
+        Some(&id),
+        "{}",
+    )?;
 
     tx.commit()?;
     Ok(Json(serde_json::json!({ "status": "ok" })))
@@ -330,19 +356,23 @@ async fn cancel_purchase(
     let mut conn = state.db.lock().expect("db mutex poisoned");
     let tx = conn.transaction()?;
 
-    let status: String = tx.query_row(
-        "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
-        rusqlite::params![id, user.business_id],
-        |r| r.get(0)
-    ).map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
+    let status: String = tx
+        .query_row(
+            "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
+            rusqlite::params![id, user.business_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
 
     if status != "draft" {
-        return Err(ApiError::Conflict("Only draft purchases can be cancelled directly".into()));
+        return Err(ApiError::Conflict(
+            "Only draft purchases can be cancelled directly".into(),
+        ));
     }
 
     tx.execute(
         "UPDATE purchases SET status = 'void', updated_at = ?1 WHERE purchase_id = ?2",
-        rusqlite::params![now_iso(), id]
+        rusqlite::params![now_iso(), id],
     )?;
 
     tx.commit()?;
@@ -358,12 +388,18 @@ async fn upload_bill_image(
     // Validate purchase
     {
         let conn = state.db.lock().expect("db mutex poisoned");
-        let status: String = conn.query_row(
-            "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
-            rusqlite::params![id, user.business_id],
-            |r| r.get(0)
-        ).map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
-        if status != "draft" { return Err(ApiError::Forbidden("Cannot attach images to non-draft purchase".into())); }
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
+                rusqlite::params![id, user.business_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
+        if status != "draft" {
+            return Err(ApiError::Forbidden(
+                "Cannot attach images to non-draft purchase".into(),
+            ));
+        }
     }
 
     let mut image_bytes = None;
@@ -375,23 +411,29 @@ async fn upload_bill_image(
                     return Err(ApiError::BadRequest("Only images are allowed".into()));
                 }
             }
-            image_bytes = Some(field.bytes().await.map_err(|_| ApiError::BadRequest("Failed to read file".into()))?);
+            image_bytes = Some(
+                field
+                    .bytes()
+                    .await
+                    .map_err(|_| ApiError::BadRequest("Failed to read file".into()))?,
+            );
         }
     }
 
     let bytes = image_bytes.ok_or_else(|| ApiError::BadRequest("No file provided".into()))?;
-    if bytes.len() > 10 * 1024 * 1024 { // 10MB limit
+    if bytes.len() > 10 * 1024 * 1024 {
+        // 10MB limit
         return Err(ApiError::BadRequest("File too large".into()));
     }
 
     let sha256_hex = hex::encode(sha2::Sha256::digest(&bytes));
-    
+
     // Store in a safe local path (prevent traversal)
     let upload_dir = PathBuf::from("uploads");
     if !upload_dir.exists() {
         fs::create_dir_all(&upload_dir).await.unwrap();
     }
-    
+
     let file_path = upload_dir.join(format!("{}.jpg", sha256_hex));
     fs::write(&file_path, bytes).await.unwrap();
 
@@ -421,33 +463,40 @@ async fn process_ocr(
     Json(req): Json<OcrRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // 1. Validate
-    let conn = state.db.lock().expect("db mutex poisoned");
-    let status: String = conn.query_row(
-        "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
-        rusqlite::params![id, user.business_id],
-        |r| r.get(0)
-    ).map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
-    
-    if status != "draft" { return Err(ApiError::Forbidden("Cannot run OCR on non-draft".into())); }
+    {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
+                rusqlite::params![id, user.business_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
 
-    let image_exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM bill_images WHERE image_id = ?1 AND purchase_id = ?2",
-        rusqlite::params![req.image_id, id],
-        |r| r.get(0)
-    )?;
-    
-    if image_exists == 0 { return Err(ApiError::NotFound("Image not found on this purchase".into())); }
+        if status != "draft" {
+            return Err(ApiError::Forbidden("Cannot run OCR on non-draft".into()));
+        }
 
-    // Drop lock before async long-running OCR
-    drop(conn);
+        let image_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM bill_images WHERE image_id = ?1 AND purchase_id = ?2",
+            rusqlite::params![req.image_id, id],
+            |r| r.get(0),
+        )?;
+
+        if image_exists == 0 {
+            return Err(ApiError::NotFound(
+                "Image not found on this purchase".into(),
+            ));
+        }
+    }
 
     // 2. Mock PaddleOCR Execution Boundary
     // In a real implementation this would spawn a local process: `paddleocr --image_dir uploads/img.jpg`
     tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-    
+
     let ocr_id = new_id();
-    
-    let mut conn = state.db.lock().expect("db mutex poisoned");
+
+    let conn = state.db.lock().expect("db mutex poisoned");
     conn.execute(
         "INSERT INTO ocr_results (ocr_id, image_id, text_json, boxes_json, confidence, engine_version, created_at) 
          VALUES (?1, ?2, '[]', '[]', 0.95, 'mock_paddle_ocr_v1', ?3)",

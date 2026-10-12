@@ -1,16 +1,18 @@
 //! Integration tests for the inventory transaction engine (Phase 05).
 
-use std::sync::{Arc, Mutex};
 use artha_server::{build_app, db, AppState};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 fn test_app() -> axum::Router {
     let conn = db::open_in_memory();
-    let state = AppState { db: Arc::new(Mutex::new(conn)) };
+    let state = AppState {
+        db: Arc::new(Mutex::new(conn)),
+    };
     build_app(state)
 }
 
@@ -20,7 +22,10 @@ async fn body_json(resp: axum::response::Response) -> Value {
 }
 
 fn json_request(method: &str, uri: &str, token: Option<&str>, body: Value) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
     if let Some(t) = token {
         builder = builder.header("authorization", format!("Bearer {t}"));
     }
@@ -40,7 +45,10 @@ async fn create_product(app: &axum::Router, token: &str, name: &str, qr: &str) -
         "POST", "/api/products", Some(token),
         json!({ "name": name, "qr_code": qr, "price_paise": 1000, "cost_paise": 500, "gst_rate_bps": 500 }),
     )).await.unwrap();
-    body_json(resp).await["product_id"].as_str().unwrap().to_string()
+    body_json(resp).await["product_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 #[tokio::test]
@@ -50,21 +58,42 @@ async fn inventory_transactions_and_constraints() {
     let product_id = create_product(&app, &token, "Widget", "QR-WIDGET").await;
 
     // 1. Opening stock
-    let resp = app.clone().oneshot(json_request(
-        "POST", "/api/inventory/opening", Some(&token),
-        json!({ "product_id": product_id, "quantity_milli": 10_000 }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/inventory/opening",
+            Some(&token),
+            json!({ "product_id": product_id, "quantity_milli": 10_000 }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // 2. Duplicate opening stock rejected
-    let resp = app.clone().oneshot(json_request(
-        "POST", "/api/inventory/opening", Some(&token),
-        json!({ "product_id": product_id, "quantity_milli": 5_000 }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/inventory/opening",
+            Some(&token),
+            json!({ "product_id": product_id, "quantity_milli": 5_000 }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
     // 3. Positive stock calculation
-    let resp = app.clone().oneshot(json_request("GET", &format!("/api/inventory/{}", product_id), Some(&token), Value::Null)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", product_id),
+            Some(&token),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
     let body = body_json(resp).await;
     assert_eq!(body["current_stock_milli"], 10_000);
 
@@ -83,32 +112,68 @@ async fn inventory_transactions_and_constraints() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // 6. Check stock is now 13_000
-    let resp = app.clone().oneshot(json_request("GET", &format!("/api/inventory/{}", product_id), Some(&token), Value::Null)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", product_id),
+            Some(&token),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
     assert_eq!(body_json(resp).await["current_stock_milli"], 13_000);
 
     // 7. Negative stock rejection
-    let resp = app.clone().oneshot(json_request(
-        "POST", "/api/inventory/adjust", Some(&token),
-        json!({ "product_id": product_id, "quantity_milli": -15_000, "reason": "Big sale" }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/inventory/adjust",
+            Some(&token),
+            json!({ "product_id": product_id, "quantity_milli": -15_000, "reason": "Big sale" }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // 8. Adjustment with no reason rejected
-    let resp = app.clone().oneshot(json_request(
-        "POST", "/api/inventory/adjust", Some(&token),
-        json!({ "product_id": product_id, "quantity_milli": -1_000, "reason": "" }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/inventory/adjust",
+            Some(&token),
+            json!({ "product_id": product_id, "quantity_milli": -1_000, "reason": "" }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // 9. Zero quantity rejected
-    let resp = app.clone().oneshot(json_request(
-        "POST", "/api/inventory/adjust", Some(&token),
-        json!({ "product_id": product_id, "quantity_milli": 0, "reason": "Nothing" }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/inventory/adjust",
+            Some(&token),
+            json!({ "product_id": product_id, "quantity_milli": 0, "reason": "Nothing" }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // 10. Check history
-    let resp = app.clone().oneshot(json_request("GET", &format!("/api/inventory/{}/history", product_id), Some(&token), Value::Null)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}/history", product_id),
+            Some(&token),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
     let history = body_json(resp).await;
     let list = history.as_array().unwrap();
     assert_eq!(list.len(), 3); // Opening, Adjust +5, Adjust -2
@@ -118,10 +183,15 @@ async fn inventory_transactions_and_constraints() {
 
     // 11. Archived product rejection
     // Archive product
-    app.clone().oneshot(json_request(
-        "PATCH", &format!("/api/products/{}", product_id), Some(&token),
-        json!({ "status": "archived" }),
-    )).await.unwrap();
+    app.clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/api/products/{}", product_id),
+            Some(&token),
+            json!({ "status": "archived" }),
+        ))
+        .await
+        .unwrap();
 
     // Try adjustment
     let resp = app.clone().oneshot(json_request(
@@ -131,34 +201,49 @@ async fn inventory_transactions_and_constraints() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // 12. Unauthorized
-    let resp = app.clone().oneshot(json_request(
-        "POST", "/api/inventory/adjust", None,
-        json!({ "product_id": product_id, "quantity_milli": 1_000, "reason": "No token" }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/inventory/adjust",
+            None,
+            json!({ "product_id": product_id, "quantity_milli": 1_000, "reason": "No token" }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn inventory_concurrency_protection() {
     let conn = db::open_in_memory();
-    let state = AppState { db: Arc::new(Mutex::new(conn)) };
+    let state = AppState {
+        db: Arc::new(Mutex::new(conn)),
+    };
     let app = build_app(state);
-    
+
     let token = setup_owner(&app).await;
     let product_id = create_product(&app, &token, "Stock Limit", "QR-LIMIT").await;
 
     // Set opening stock to 5 units
-    app.clone().oneshot(json_request(
-        "POST", "/api/inventory/opening", Some(&token),
-        json!({ "product_id": product_id, "quantity_milli": 5_000 }),
-    )).await.unwrap();
+    app.clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/inventory/opening",
+            Some(&token),
+            json!({ "product_id": product_id, "quantity_milli": 5_000 }),
+        ))
+        .await
+        .unwrap();
 
     // Spawn 10 concurrent requests subtracting 1 unit each.
     // SQLite locking via Mutex enforces serial execution, so the first 5 should succeed and the next 5 should fail with BAD_REQUEST (insufficient stock).
     let mut futures = vec![];
     for _ in 0..10 {
         let req = json_request(
-            "POST", "/api/inventory/adjust", Some(&token),
+            "POST",
+            "/api/inventory/adjust",
+            Some(&token),
             json!({ "product_id": product_id, "quantity_milli": -1_000, "reason": "Concurrent drain" }),
         );
         futures.push(app.clone().oneshot(req));
@@ -181,6 +266,15 @@ async fn inventory_concurrency_protection() {
     assert_eq!(failures, 5);
 
     // Final balance should be exactly 0.
-    let resp = app.clone().oneshot(json_request("GET", &format!("/api/inventory/{}", product_id), Some(&token), Value::Null)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", product_id),
+            Some(&token),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
     assert_eq!(body_json(resp).await["current_stock_milli"], 0);
 }

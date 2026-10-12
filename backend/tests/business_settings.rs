@@ -1,4 +1,4 @@
-//! Integration tests for Business Profile & Document Settings (Phase 08).
+//! Integration tests for Business Profile & Document Settings (Phase 08 & 08.1).
 //!
 //! Tests:
 //! 1. Authenticated user can read business profile.
@@ -8,17 +8,27 @@
 //! 5. Owner can update business name, contact, address, GSTIN, and print settings.
 //! 6. Validation: reject empty business name, invalid email, invalid layout.
 //! 7. Business settings persist across subsequent GET requests.
-//! 8. Logo upload validation: rejects SVG and invalid payloads.
-//! 9. Valid raster logo upload succeeds and persists.
-//! 10. Logo deletion clears logo and persists.
-//! 11. Audit log records settings and logo operations.
+//! 8. Logo upload validation: reject SVG and HTML payloads.
+//! 9. Reject unsupported MIME (GIF, BMP, PDF).
+//! 10. Reject missing data URL separator or missing ';base64'.
+//! 11. Reject empty payload.
+//! 12. Reject invalid base64 (illegal characters, unaligned length, middle padding, non-zero padding bits, whitespace).
+//! 13. Reject signature mismatch (declared PNG, but contains arbitrary non-PNG bytes).
+//! 14. Valid raster logo upload succeeds and persists.
+//! 15. Failed upload preserves existing valid logo unchanged.
+//! 16. Valid minimal JPEG upload succeeds and verifies JPEG magic bytes.
+//! 17. Valid minimal WebP upload succeeds and verifies WebP RIFF/WEBP magic bytes.
+//! 18. Reject MIME-signature mismatch (declared PNG but contains JPEG bytes).
+//! 19. Staff cannot delete logo (403).
+//! 20. Owner successfully deletes logo (200).
+//! 21. Audit log records settings and logo operations.
 
-use std::sync::{Arc, Mutex};
 use artha_server::{build_app, db, AppState};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 fn test_app_with_state() -> (axum::Router, AppState) {
@@ -27,10 +37,6 @@ fn test_app_with_state() -> (axum::Router, AppState) {
         db: Arc::new(Mutex::new(conn)),
     };
     (build_app(state.clone()), state)
-}
-
-fn test_app() -> axum::Router {
-    test_app_with_state().0
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
@@ -110,7 +116,12 @@ async fn test_business_profile_and_settings_workflow() {
     // 1. Authenticated staff can read business profile
     let get_resp = app
         .clone()
-        .oneshot(json_request("GET", "/api/business", Some(&staff_token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            "/api/business",
+            Some(&staff_token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(get_resp.status(), StatusCode::OK);
@@ -229,13 +240,21 @@ async fn test_business_profile_and_settings_workflow() {
     // 7. Settings persist across subsequent GET requests
     let verify_get = app
         .clone()
-        .oneshot(json_request("GET", "/api/business", Some(&staff_token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            "/api/business",
+            Some(&staff_token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(verify_get.status(), StatusCode::OK);
     let verify_body = body_json(verify_get).await;
     assert_eq!(verify_body["name"], "Artha Supermart");
-    assert_eq!(verify_body["settings"]["registered_name"], "Artha Enterprises Pvt Ltd");
+    assert_eq!(
+        verify_body["settings"]["registered_name"],
+        "Artha Enterprises Pvt Ltd"
+    );
     assert_eq!(verify_body["settings"]["phone"], "+91 9876543210");
     assert_eq!(verify_body["settings"]["default_layout"], "thermal");
 
@@ -315,7 +334,7 @@ async fn test_business_profile_and_settings_workflow() {
         .unwrap();
     assert_eq!(empty_payload.status(), StatusCode::BAD_REQUEST);
 
-    // 12. Reject invalid base64 (illegal characters, wrong padding)
+    // 12. Reject invalid base64 (illegal characters, wrong padding, unaligned length, non-zero padding bits, whitespace)
     let invalid_b64 = app
         .clone()
         .oneshot(json_request(
@@ -327,6 +346,58 @@ async fn test_business_profile_and_settings_workflow() {
         .await
         .unwrap();
     assert_eq!(invalid_b64.status(), StatusCode::BAD_REQUEST);
+
+    // Unaligned length (not a multiple of 4)
+    let unaligned_b64 = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png;base64,AAA" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unaligned_b64.status(), StatusCode::BAD_REQUEST);
+
+    // Padding in the middle of payload
+    let mid_pad_b64 = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png;base64,AA==AAAA" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mid_pad_b64.status(), StatusCode::BAD_REQUEST);
+
+    // Non-zero padding bits
+    let nonzero_pad_b64 = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png;base64,Zh==" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(nonzero_pad_b64.status(), StatusCode::BAD_REQUEST);
+
+    // Embedded whitespace
+    let ws_b64 = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/business/logo",
+            Some(&owner_token),
+            json!({ "logo_data_url": "data:image/png;base64,iVBO Rw0K GgoA AA==" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ws_b64.status(), StatusCode::BAD_REQUEST);
 
     // 13. Reject signature mismatch (declared PNG, but contains arbitrary non-PNG bytes)
     let malformed_sig = app
@@ -372,12 +443,20 @@ async fn test_business_profile_and_settings_workflow() {
 
     let verify_unchanged = app
         .clone()
-        .oneshot(json_request("GET", "/api/business", Some(&owner_token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            "/api/business",
+            Some(&owner_token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(verify_unchanged.status(), StatusCode::OK);
     let verify_unchanged_body = body_json(verify_unchanged).await;
-    assert_eq!(verify_unchanged_body["settings"]["logo_data_url"], valid_png_url);
+    assert_eq!(
+        verify_unchanged_body["settings"]["logo_data_url"],
+        valid_png_url
+    );
 
     // 16. Valid minimal JPEG upload succeeds and verifies JPEG magic bytes
     let valid_jpeg_url = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=";
@@ -394,7 +473,8 @@ async fn test_business_profile_and_settings_workflow() {
     assert_eq!(logo_jpeg_resp.status(), StatusCode::OK);
 
     // 17. Valid minimal WebP upload succeeds and verifies WebP RIFF/WEBP magic bytes
-    let valid_webp_url = "data:image/webp;base64,UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAD8D+JaQAA3AA/ua1AAA=";
+    let valid_webp_url =
+        "data:image/webp;base64,UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAD8D+JaQAA3AA/ua1AAA=";
     let logo_webp_resp = app
         .clone()
         .oneshot(json_request(
@@ -423,7 +503,12 @@ async fn test_business_profile_and_settings_workflow() {
     // 19. Staff cannot delete logo (403)
     let staff_del_resp = app
         .clone()
-        .oneshot(json_request("DELETE", "/api/business/logo", Some(&staff_token), Value::Null))
+        .oneshot(json_request(
+            "DELETE",
+            "/api/business/logo",
+            Some(&staff_token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(staff_del_resp.status(), StatusCode::FORBIDDEN);
@@ -431,7 +516,12 @@ async fn test_business_profile_and_settings_workflow() {
     // 20. Owner successfully deletes logo (200)
     let del_logo_resp = app
         .clone()
-        .oneshot(json_request("DELETE", "/api/business/logo", Some(&owner_token), Value::Null))
+        .oneshot(json_request(
+            "DELETE",
+            "/api/business/logo",
+            Some(&owner_token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(del_logo_resp.status(), StatusCode::OK);
@@ -451,4 +541,3 @@ async fn test_business_profile_and_settings_workflow() {
         assert!(audit_count >= 3);
     }
 }
-

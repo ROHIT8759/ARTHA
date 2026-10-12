@@ -6,8 +6,8 @@
 //! Business-feature tests (auth, products, ...) live in `tests/smoke.rs`;
 //! this file is scoped to the infrastructure layer only.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use artha_server::config::{Config, Environment};
 use artha_server::{build_app, db, AppState};
@@ -19,7 +19,10 @@ use tower::ServiceExt;
 fn temp_db_path(label: &str) -> std::path::PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("artha_foundation_test_{label}_{}_{n}.db", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "artha_foundation_test_{label}_{}_{n}.db",
+        std::process::id()
+    ))
 }
 
 fn remove_db_and_sidecars(path: &std::path::Path) {
@@ -36,11 +39,18 @@ fn remove_db_and_sidecars(path: &std::path::Path) {
 #[tokio::test]
 async fn application_starts_and_serves_a_request() {
     let conn = db::open_in_memory();
-    let state = AppState { db: Arc::new(Mutex::new(conn)) };
+    let state = AppState {
+        db: Arc::new(Mutex::new(conn)),
+    };
     let app = build_app(state);
 
     let resp = app
-        .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .expect("router should handle the request without panicking");
 
@@ -57,9 +67,14 @@ async fn database_initializes_and_runs_migrations_on_a_real_file() {
     let conn = db::open_and_migrate(&path).expect("database should open and migrate");
 
     let schema_version: i64 = conn
-        .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+            r.get(0)
+        })
         .expect("migrations should have recorded a schema version");
-    assert_eq!(schema_version, 1, "migration 0001_init.sql should be applied");
+    assert_eq!(
+        schema_version, 4,
+        "all migrations up to 0004_sales_updates.sql should be applied"
+    );
 
     // A representative table from that migration must actually exist.
     let table_exists: i64 = conn
@@ -80,11 +95,18 @@ async fn database_initializes_and_runs_migrations_on_a_real_file() {
 #[tokio::test]
 async fn health_endpoint_reports_the_server_is_running() {
     let conn = db::open_in_memory();
-    let state = AppState { db: Arc::new(Mutex::new(conn)) };
+    let state = AppState {
+        db: Arc::new(Mutex::new(conn)),
+    };
     let app = build_app(state);
 
     let resp = app
-        .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -109,7 +131,8 @@ fn configuration_loads_with_defaults_and_overrides() {
     let mut vars = HashMap::new();
     vars.insert("ARTHA_PORT", "9999");
     vars.insert("ARTHA_ENV", "production");
-    let overridden = Config::from_lookup(|k: &str| vars.get(k).map(|v| v.to_string())).expect("valid overrides should load");
+    let overridden = Config::from_lookup(|k: &str| vars.get(k).map(|v| v.to_string()))
+        .expect("valid overrides should load");
     assert_eq!(overridden.port, 9999);
     assert_eq!(overridden.environment, Environment::Production);
     assert_eq!(overridden.socket_addr().port(), 9999);

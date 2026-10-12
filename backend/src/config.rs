@@ -44,11 +44,18 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::InvalidPort(v) => write!(f, "ARTHA_PORT must be a valid port number, got {v:?}"),
-            ConfigError::InvalidEnvironment(v) => {
-                write!(f, "ARTHA_ENV must be 'development' or 'production', got {v:?}")
+            ConfigError::InvalidPort(v) => {
+                write!(f, "ARTHA_PORT must be a valid port number, got {v:?}")
             }
-            ConfigError::InvalidHost(v) => write!(f, "ARTHA_HOST is not a resolvable host, got {v:?}"),
+            ConfigError::InvalidEnvironment(v) => {
+                write!(
+                    f,
+                    "ARTHA_ENV must be 'development' or 'production', got {v:?}"
+                )
+            }
+            ConfigError::InvalidHost(v) => {
+                write!(f, "ARTHA_HOST is not a resolvable host, got {v:?}")
+            }
         }
     }
 }
@@ -76,11 +83,15 @@ impl Config {
         let host = get("ARTHA_HOST").unwrap_or_else(|| DEFAULT_HOST.to_string());
 
         let port = match get("ARTHA_PORT") {
-            Some(raw) => raw.parse::<u16>().map_err(|_| ConfigError::InvalidPort(raw))?,
+            Some(raw) => raw
+                .parse::<u16>()
+                .map_err(|_| ConfigError::InvalidPort(raw))?,
             None => DEFAULT_PORT,
         };
 
-        let db_path = get("ARTHA_DB_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
+        let db_path = get("ARTHA_DB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
 
         let log_level = get("ARTHA_LOG_LEVEL").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string());
 
@@ -99,7 +110,13 @@ impl Config {
             .to_socket_addrs()
             .map_err(|_| ConfigError::InvalidHost(host.clone()))?;
 
-        Ok(Config { host, port, db_path, log_level, environment })
+        Ok(Config {
+            host,
+            port,
+            db_path,
+            log_level,
+            environment,
+        })
     }
 
     /// The address to bind the HTTP listener to.
@@ -117,7 +134,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn lookup(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + '_ {
+    fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         let map: HashMap<&str, &str> = vars.iter().copied().collect();
         move |key| map.get(key).map(|v| v.to_string())
     }
@@ -151,10 +168,22 @@ mod tests {
 
     #[test]
     fn environment_accepts_short_aliases() {
-        assert_eq!(Config::from_lookup(lookup(&[("ARTHA_ENV", "dev")])).unwrap().environment, Environment::Development);
-        assert_eq!(Config::from_lookup(lookup(&[("ARTHA_ENV", "prod")])).unwrap().environment, Environment::Production);
         assert_eq!(
-            Config::from_lookup(lookup(&[("ARTHA_ENV", "PRODUCTION")])).unwrap().environment,
+            Config::from_lookup(lookup(&[("ARTHA_ENV", "dev")]))
+                .unwrap()
+                .environment,
+            Environment::Development
+        );
+        assert_eq!(
+            Config::from_lookup(lookup(&[("ARTHA_ENV", "prod")]))
+                .unwrap()
+                .environment,
+            Environment::Production
+        );
+        assert_eq!(
+            Config::from_lookup(lookup(&[("ARTHA_ENV", "PRODUCTION")]))
+                .unwrap()
+                .environment,
             Environment::Production
         );
     }
@@ -179,7 +208,11 @@ mod tests {
 
     #[test]
     fn socket_addr_combines_host_and_port() {
-        let cfg = Config::from_lookup(lookup(&[("ARTHA_HOST", "127.0.0.1"), ("ARTHA_PORT", "9090")])).unwrap();
+        let cfg = Config::from_lookup(lookup(&[
+            ("ARTHA_HOST", "127.0.0.1"),
+            ("ARTHA_PORT", "9090"),
+        ]))
+        .unwrap();
         assert_eq!(cfg.socket_addr().to_string(), "127.0.0.1:9090");
     }
 }

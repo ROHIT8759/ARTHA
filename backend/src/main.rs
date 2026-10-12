@@ -23,7 +23,9 @@ async fn main() {
     logging::init(&config);
 
     let conn = db::open_and_migrate(&config.db_path).expect("failed to open/migrate database");
-    let state = AppState { db: Arc::new(Mutex::new(conn)) };
+    let state = AppState {
+        db: Arc::new(Mutex::new(conn)),
+    };
     let app = build_app(state);
 
     let addr = config.socket_addr();
@@ -31,7 +33,9 @@ async fn main() {
     println!("ARTHA server listening on http://{addr}");
     println!("Staff on this Wi-Fi/LAN can connect using this PC's local IP instead of {}, e.g. http://<this-pc-ip>:{}", config.host, addr.port());
 
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind address");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("failed to bind address");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -39,6 +43,8 @@ async fn main() {
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c().await.expect("failed to listen for ctrl_c");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for ctrl_c");
     tracing::info!("shutdown signal received");
 }

@@ -49,7 +49,5 @@ fn format_unix(secs: u64, millis: u32) -> String {
     let m_ = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m_ <= 2 { y + 1 } else { y };
 
-    format!(
-        "{y:04}-{m_:02}-{d:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z"
-    )
+    format!("{y:04}-{m_:02}-{d:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
 }

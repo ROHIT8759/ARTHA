@@ -1,12 +1,12 @@
-mod health;
-mod products;
-mod setup;
-mod users;
-mod inventory;
-mod purchases;
-mod suppliers;
-mod sales;
 mod business;
+mod health;
+mod inventory;
+mod products;
+mod purchases;
+mod sales;
+mod setup;
+mod suppliers;
+mod users;
 
 use axum::Router;
 

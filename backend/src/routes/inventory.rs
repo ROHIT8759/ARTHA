@@ -17,7 +17,10 @@ use crate::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/inventory/:product_id", get(get_inventory_status))
-        .route("/api/inventory/:product_id/history", get(get_inventory_history))
+        .route(
+            "/api/inventory/:product_id/history",
+            get(get_inventory_history),
+        )
         .route("/api/inventory/opening", post(post_opening_stock))
         .route("/api/inventory/adjust", post(post_adjustment))
 }
@@ -93,13 +96,14 @@ async fn get_inventory_history(
     Path(product_id): Path<String>,
 ) -> Result<Json<Vec<InventoryTransactionView>>, ApiError> {
     let conn = state.db.lock().expect("db mutex poisoned");
-    
+
     // Ensure product exists (and check access)
-    let _ = conn.query_row(
+    conn.query_row(
         "SELECT 1 FROM products WHERE business_id = ?1 AND product_id = ?2",
         rusqlite::params![user.business_id, product_id],
         |_| Ok(()),
-    ).map_err(|_| ApiError::NotFound("product not found".into()))?;
+    )
+    .map_err(|_| ApiError::NotFound("product not found".into()))?;
 
     let mut stmt = conn.prepare(
         "SELECT transaction_id, transaction_type, quantity_milli, reference_id, reason, created_by, created_at 
@@ -125,11 +129,12 @@ async fn get_inventory_history(
     for row in rows {
         history.push(row?);
     }
-    
+
     Ok(Json(history))
 }
 
 /// Helper function to encapsulate the atomic transaction insertion and constraint checking.
+#[allow(clippy::too_many_arguments)]
 fn record_inventory_movement(
     conn: &mut rusqlite::Connection,
     business_id: &str,
@@ -156,7 +161,9 @@ fn record_inventory_movement(
         .map_err(|_| ApiError::NotFound("product not found".into()))?;
 
     if status != "active" {
-        return Err(ApiError::Forbidden("cannot change inventory for archived products".into()));
+        return Err(ApiError::Forbidden(
+            "cannot change inventory for archived products".into(),
+        ));
     }
 
     // 2. Prevent duplicate opening stock
@@ -167,10 +174,14 @@ fn record_inventory_movement(
             |r| r.get(0),
         )?;
         if existing_opening > 0 {
-            return Err(ApiError::Conflict("opening stock is already set for this product".into()));
+            return Err(ApiError::Conflict(
+                "opening stock is already set for this product".into(),
+            ));
         }
         if qty < 0 {
-            return Err(ApiError::BadRequest("opening stock cannot be negative".into()));
+            return Err(ApiError::BadRequest(
+                "opening stock cannot be negative".into(),
+            ));
         }
     }
 
@@ -218,9 +229,9 @@ async fn post_opening_stock(
     Json(req): Json<OpeningStockRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut conn = state.db.lock().expect("db mutex poisoned");
-    
-    // Authorization: Owner or staff. The core product system currently doesn't 
-    // fragment permissions beyond AuthUser access. 
+
+    // Authorization: Owner or staff. The core product system currently doesn't
+    // fragment permissions beyond AuthUser access.
     // If needed we can enforce require_owner() here in the future.
 
     record_inventory_movement(
@@ -243,7 +254,9 @@ async fn post_adjustment(
     Json(req): Json<AdjustmentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if req.reason.trim().is_empty() {
-        return Err(ApiError::BadRequest("reason is required for manual adjustments".into()));
+        return Err(ApiError::BadRequest(
+            "reason is required for manual adjustments".into(),
+        ));
     }
 
     let mut conn = state.db.lock().expect("db mutex poisoned");

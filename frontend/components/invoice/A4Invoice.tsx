@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { SaleView, BusinessView, formatPaise, amountToWords } from "@/lib/api";
+import { SaleView, BusinessView, formatPaise, amountToWords, computeTaxSlabs } from "@/lib/api";
 
 interface A4InvoiceProps {
   sale: SaleView;
@@ -27,25 +27,8 @@ export default function A4Invoice({ sale, business }: A4InvoiceProps) {
   ].filter(Boolean);
   const formattedAddress = addressParts.join(", ");
 
-  // Authoritative Tax Slab Breakdown from persisted line records
-  // Derivation identity: line_total_paise = taxable_line + tax_paise
-  // Therefore: taxable_line = line_total_paise - tax_paise (exact integer paise, no float rounding errors)
-  const taxSlabs: { [key: number]: { rateBps: number; taxablePaise: number; taxPaise: number } } = {};
-  for (const item of sale.items) {
-    const lineTax = item.tax_paise;
-    const taxable = Math.max(0, item.line_total_paise - lineTax);
-
-    if (!taxSlabs[item.gst_rate_bps]) {
-      taxSlabs[item.gst_rate_bps] = {
-        rateBps: item.gst_rate_bps,
-        taxablePaise: 0,
-        taxPaise: 0,
-      };
-    }
-    taxSlabs[item.gst_rate_bps].taxablePaise += taxable;
-    taxSlabs[item.gst_rate_bps].taxPaise += lineTax;
-  }
-
+  // Authoritative Tax Slab Breakdown from persisted line records using shared tested helper
+  const taxSlabs = computeTaxSlabs(sale.items);
   const slabList = Object.values(taxSlabs).sort((a, b) => a.rateBps - b.rateBps);
 
   // Document Title & Badges

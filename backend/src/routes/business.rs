@@ -6,7 +6,7 @@
 //! business details for billing and invoice generation.
 
 use axum::extract::State;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::auth::AuthUser;
@@ -21,7 +21,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/business/logo", post(upload_logo).delete(remove_logo))
 }
 
-fn fetch_business(conn: &rusqlite::Connection, business_id: &str) -> Result<BusinessView, ApiError> {
+fn fetch_business(
+    conn: &rusqlite::Connection,
+    business_id: &str,
+) -> Result<BusinessView, ApiError> {
     let row = conn
         .query_row(
             "SELECT business_id, name, settings_json, created_at, updated_at \
@@ -40,8 +43,7 @@ fn fetch_business(conn: &rusqlite::Connection, business_id: &str) -> Result<Busi
         .map_err(|_| ApiError::NotFound("Business not found".into()))?;
 
     let (biz_id, name, settings_json, created_at, updated_at) = row;
-    let settings: BusinessSettingsView =
-        serde_json::from_str(&settings_json).unwrap_or_default();
+    let settings: BusinessSettingsView = serde_json::from_str(&settings_json).unwrap_or_default();
 
     Ok(BusinessView {
         business_id: biz_id,
@@ -78,7 +80,9 @@ async fn update_business(
             return Err(ApiError::BadRequest("Business name cannot be empty".into()));
         }
         if trimmed.len() > 100 {
-            return Err(ApiError::BadRequest("Business name cannot exceed 100 characters".into()));
+            return Err(ApiError::BadRequest(
+                "Business name cannot exceed 100 characters".into(),
+            ));
         }
     }
 
@@ -88,28 +92,36 @@ async fn update_business(
             return Err(ApiError::BadRequest("Invalid email address format".into()));
         }
         if trimmed.len() > 100 {
-            return Err(ApiError::BadRequest("Email cannot exceed 100 characters".into()));
+            return Err(ApiError::BadRequest(
+                "Email cannot exceed 100 characters".into(),
+            ));
         }
     }
 
     if let Some(ref phone) = req.phone {
         let trimmed = phone.trim();
         if trimmed.len() > 30 {
-            return Err(ApiError::BadRequest("Phone number cannot exceed 30 characters".into()));
+            return Err(ApiError::BadRequest(
+                "Phone number cannot exceed 30 characters".into(),
+            ));
         }
     }
 
     if let Some(ref gstin) = req.gstin {
         let trimmed = gstin.trim();
         if trimmed.len() > 20 {
-            return Err(ApiError::BadRequest("GSTIN cannot exceed 20 characters".into()));
+            return Err(ApiError::BadRequest(
+                "GSTIN cannot exceed 20 characters".into(),
+            ));
         }
     }
 
     if let Some(ref layout) = req.default_layout {
         let l = layout.trim().to_lowercase();
         if l != "a4" && l != "thermal" {
-            return Err(ApiError::BadRequest("Default layout must be 'a4' or 'thermal'".into()));
+            return Err(ApiError::BadRequest(
+                "Default layout must be 'a4' or 'thermal'".into(),
+            ));
         }
     }
 
@@ -120,40 +132,87 @@ async fn update_business(
     let mut settings = current.settings;
 
     // Apply updates
-    let updated_name = req.name.map(|n| n.trim().to_string()).unwrap_or(current.name);
+    let updated_name = req
+        .name
+        .map(|n| n.trim().to_string())
+        .unwrap_or(current.name);
 
     if let Some(rn) = req.registered_name {
-        settings.registered_name = if rn.trim().is_empty() { None } else { Some(rn.trim().to_string()) };
+        settings.registered_name = if rn.trim().is_empty() {
+            None
+        } else {
+            Some(rn.trim().to_string())
+        };
     }
     if let Some(addr) = req.address {
-        settings.address = if addr.trim().is_empty() { None } else { Some(addr.trim().to_string()) };
+        settings.address = if addr.trim().is_empty() {
+            None
+        } else {
+            Some(addr.trim().to_string())
+        };
     }
     if let Some(c) = req.city {
-        settings.city = if c.trim().is_empty() { None } else { Some(c.trim().to_string()) };
+        settings.city = if c.trim().is_empty() {
+            None
+        } else {
+            Some(c.trim().to_string())
+        };
     }
     if let Some(s) = req.state {
-        settings.state = if s.trim().is_empty() { None } else { Some(s.trim().to_string()) };
+        settings.state = if s.trim().is_empty() {
+            None
+        } else {
+            Some(s.trim().to_string())
+        };
     }
     if let Some(p) = req.pincode {
-        settings.pincode = if p.trim().is_empty() { None } else { Some(p.trim().to_string()) };
+        settings.pincode = if p.trim().is_empty() {
+            None
+        } else {
+            Some(p.trim().to_string())
+        };
     }
     if let Some(co) = req.country {
-        settings.country = if co.trim().is_empty() { None } else { Some(co.trim().to_string()) };
+        settings.country = if co.trim().is_empty() {
+            None
+        } else {
+            Some(co.trim().to_string())
+        };
     }
     if let Some(ph) = req.phone {
-        settings.phone = if ph.trim().is_empty() { None } else { Some(ph.trim().to_string()) };
+        settings.phone = if ph.trim().is_empty() {
+            None
+        } else {
+            Some(ph.trim().to_string())
+        };
     }
     if let Some(em) = req.email {
-        settings.email = if em.trim().is_empty() { None } else { Some(em.trim().to_string()) };
+        settings.email = if em.trim().is_empty() {
+            None
+        } else {
+            Some(em.trim().to_string())
+        };
     }
     if let Some(g) = req.gstin {
-        settings.gstin = if g.trim().is_empty() { None } else { Some(g.trim().to_uppercase()) };
+        settings.gstin = if g.trim().is_empty() {
+            None
+        } else {
+            Some(g.trim().to_uppercase())
+        };
     }
     if let Some(footer) = req.invoice_footer {
-        settings.invoice_footer = if footer.trim().is_empty() { None } else { Some(footer.trim().to_string()) };
+        settings.invoice_footer = if footer.trim().is_empty() {
+            None
+        } else {
+            Some(footer.trim().to_string())
+        };
     }
     if let Some(terms) = req.terms_and_conditions {
-        settings.terms_and_conditions = if terms.trim().is_empty() { None } else { Some(terms.trim().to_string()) };
+        settings.terms_and_conditions = if terms.trim().is_empty() {
+            None
+        } else {
+            Some(terms.trim().to_string())
+        };
     }
     if let Some(layout) = req.default_layout {
         settings.default_layout = Some(layout.trim().to_lowercase());
@@ -197,6 +256,7 @@ const MAX_LOGO_BYTES: usize = 1_048_576;
 
 /// Strictly decodes standard RFC 4648 Base64 without external crates.
 /// Rejects non-base64 characters, improper length, invalid padding, and dirty padding bits.
+#[allow(clippy::manual_is_multiple_of, clippy::chunks_exact_to_as_chunks)]
 fn strict_decode_base64(input: &str) -> Result<Vec<u8>, ApiError> {
     if input.is_empty() {
         return Err(ApiError::BadRequest("Base64 payload is empty".into()));
@@ -204,7 +264,9 @@ fn strict_decode_base64(input: &str) -> Result<Vec<u8>, ApiError> {
 
     let bytes = input.as_bytes();
     if bytes.len() % 4 != 0 {
-        return Err(ApiError::BadRequest("Base64 payload length must be a multiple of 4".into()));
+        return Err(ApiError::BadRequest(
+            "Base64 payload length must be a multiple of 4".into(),
+        ));
     }
 
     let mut out = Vec::with_capacity((bytes.len() / 4) * 3);
@@ -216,7 +278,9 @@ fn strict_decode_base64(input: &str) -> Result<Vec<u8>, ApiError> {
             b'0'..=b'9' => Ok(b - b'0' + 52),
             b'+' => Ok(62),
             b'/' => Ok(63),
-            _ => Err(ApiError::BadRequest("Invalid Base64 character in image payload".into())),
+            _ => Err(ApiError::BadRequest(
+                "Invalid Base64 character in image payload".into(),
+            )),
         }
     };
 
@@ -229,7 +293,9 @@ fn strict_decode_base64(input: &str) -> Result<Vec<u8>, ApiError> {
         if is_last {
             if chunk[2] == b'=' {
                 if chunk[3] != b'=' {
-                    return Err(ApiError::BadRequest("Invalid Base64 padding structure".into()));
+                    return Err(ApiError::BadRequest(
+                        "Invalid Base64 padding structure".into(),
+                    ));
                 }
                 let c0 = decode_char(chunk[0])?;
                 let c1 = decode_char(chunk[1])?;
@@ -257,7 +323,9 @@ fn strict_decode_base64(input: &str) -> Result<Vec<u8>, ApiError> {
             }
         } else {
             if chunk.contains(&b'=') {
-                return Err(ApiError::BadRequest("Base64 padding '=' found before end of payload".into()));
+                return Err(ApiError::BadRequest(
+                    "Base64 padding '=' found before end of payload".into(),
+                ));
             }
             let c0 = decode_char(chunk[0])?;
             let c1 = decode_char(chunk[1])?;
@@ -269,7 +337,9 @@ fn strict_decode_base64(input: &str) -> Result<Vec<u8>, ApiError> {
         }
 
         if out.len() > MAX_LOGO_BYTES {
-            return Err(ApiError::BadRequest("Decoded logo exceeds 1 MiB size limit".into()));
+            return Err(ApiError::BadRequest(
+                "Decoded logo exceeds 1 MiB size limit".into(),
+            ));
         }
     }
 
@@ -293,28 +363,35 @@ fn validate_logo_payload(data_url: &str) -> Result<(String, usize), ApiError> {
 
     let parts: Vec<&str> = data_url.splitn(2, ',').collect();
     if parts.len() != 2 {
-        return Err(ApiError::BadRequest("Missing data URL payload separator ','".into()));
+        return Err(ApiError::BadRequest(
+            "Missing data URL payload separator ','".into(),
+        ));
     }
 
     let header = parts[0];
     let payload = parts[1].trim();
 
     if !header.ends_with(";base64") {
-        return Err(ApiError::BadRequest("Logo data URL must declare ';base64' encoding".into()));
+        return Err(ApiError::BadRequest(
+            "Logo data URL must declare ';base64' encoding".into(),
+        ));
     }
 
-    let mime = header.trim_start_matches("data:").trim_end_matches(";base64").to_lowercase();
+    let mime = header
+        .trim_start_matches("data:")
+        .trim_end_matches(";base64")
+        .to_lowercase();
 
-    let normalized_mime = match mime.as_str() {
-        "image/png" => "image/png",
-        "image/jpeg" | "image/jpg" => "image/jpeg",
-        "image/webp" => "image/webp",
-        _ => {
-            return Err(ApiError::BadRequest(
-                "Unsupported image MIME type. Only PNG, JPEG, and WebP raster images are allowed".into(),
-            ))
-        }
-    };
+    let normalized_mime =
+        match mime.as_str() {
+            "image/png" => "image/png",
+            "image/jpeg" | "image/jpg" => "image/jpeg",
+            "image/webp" => "image/webp",
+            _ => return Err(ApiError::BadRequest(
+                "Unsupported image MIME type. Only PNG, JPEG, and WebP raster images are allowed"
+                    .into(),
+            )),
+        };
 
     let decoded = strict_decode_base64(payload)?;
     if decoded.is_empty() {
@@ -322,25 +399,33 @@ fn validate_logo_payload(data_url: &str) -> Result<(String, usize), ApiError> {
     }
 
     if decoded.len() > MAX_LOGO_BYTES {
-        return Err(ApiError::BadRequest("Logo binary size exceeds 1 MiB limit".into()));
+        return Err(ApiError::BadRequest(
+            "Logo binary size exceeds 1 MiB limit".into(),
+        ));
     }
 
     // Magic byte signature validation
     match normalized_mime {
         "image/png" => {
             const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-            if decoded.len() < 8 || &decoded[0..8] != &PNG_SIG {
-                return Err(ApiError::BadRequest("File signature does not match declared PNG image format".into()));
+            if decoded.len() < 8 || decoded[0..8] != PNG_SIG {
+                return Err(ApiError::BadRequest(
+                    "File signature does not match declared PNG image format".into(),
+                ));
             }
         }
         "image/jpeg" => {
-            if decoded.len() < 3 || &decoded[0..3] != &[0xFF, 0xD8, 0xFF] {
-                return Err(ApiError::BadRequest("File signature does not match declared JPEG image format".into()));
+            if decoded.len() < 3 || decoded[0..3] != [0xFF, 0xD8, 0xFF] {
+                return Err(ApiError::BadRequest(
+                    "File signature does not match declared JPEG image format".into(),
+                ));
             }
         }
         "image/webp" => {
             if decoded.len() < 12 || &decoded[0..4] != b"RIFF" || &decoded[8..12] != b"WEBP" {
-                return Err(ApiError::BadRequest("File signature does not match declared WebP image format".into()));
+                return Err(ApiError::BadRequest(
+                    "File signature does not match declared WebP image format".into(),
+                ));
             }
         }
         _ => unreachable!(),
@@ -429,4 +514,84 @@ async fn remove_logo(
     tx.commit()?;
 
     fetch_business(&conn, &user.business_id).map(Json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strict_decode_base64_rfc_vectors() {
+        assert_eq!(strict_decode_base64("Zg==").unwrap(), b"f");
+        assert_eq!(strict_decode_base64("Zm8=").unwrap(), b"fo");
+        assert_eq!(strict_decode_base64("Zm9v").unwrap(), b"foo");
+        assert_eq!(strict_decode_base64("Zm9vYg==").unwrap(), b"foob");
+        assert_eq!(strict_decode_base64("Zm9vYmE=").unwrap(), b"fooba");
+        assert_eq!(strict_decode_base64("Zm9vYmFy").unwrap(), b"foobar");
+    }
+
+    #[test]
+    fn test_strict_decode_base64_edge_cases() {
+        // Empty payload
+        assert!(strict_decode_base64("").is_err());
+
+        // Length not a multiple of 4
+        assert!(strict_decode_base64("Z").is_err());
+        assert!(strict_decode_base64("Zg").is_err());
+        assert!(strict_decode_base64("Zg=").is_err());
+        assert!(strict_decode_base64("Zm9vY").is_err());
+        assert!(strict_decode_base64("Zm9vYm").is_err());
+        assert!(strict_decode_base64("Zm9vYmE").is_err());
+
+        // Invalid characters & whitespace
+        assert!(strict_decode_base64("Zm9-").is_err());
+        assert!(strict_decode_base64("Zm9_").is_err());
+        assert!(strict_decode_base64("Zm9!").is_err());
+        assert!(strict_decode_base64("Zm 9v").is_err());
+        assert!(strict_decode_base64("Zm\t9v").is_err());
+        assert!(strict_decode_base64("Zm\n9v").is_err());
+        assert!(strict_decode_base64("Zm\r9v").is_err());
+
+        // Malformed padding structures
+        assert!(strict_decode_base64("====").is_err());
+        assert!(strict_decode_base64("Z===").is_err());
+        assert!(strict_decode_base64("=m9v").is_err());
+        assert!(strict_decode_base64("Zm=v").is_err());
+        assert!(strict_decode_base64("Zg=A").is_err());
+        assert!(strict_decode_base64("Zm9v=AAA").is_err());
+        assert!(strict_decode_base64("Zm9vAA==").is_ok());
+
+        // Non-zero padding bits check (RFC 4648 §3.5)
+        // In "Zg==", 'g' is index 32 = 0b100000; lowest 4 bits are 0000 -> valid
+        // In "Zh==", 'h' is index 33 = 0b100001; lowest 4 bits are 0001 != 0 -> invalid
+        assert!(strict_decode_base64("Zh==").is_err());
+
+        // In "Zm8=", '8' is index 60 = 0b111100; lowest 2 bits are 00 -> valid
+        // In "Zm9=", '9' is index 61 = 0b111101; lowest 2 bits are 01 != 0 -> invalid
+        assert!(strict_decode_base64("Zm9=").is_err());
+
+        // Large payload exceeding 1 MiB limit
+        let huge = "AAAA".repeat(349_526); // 1,048,578 bytes decoded (> 1,048,576)
+        assert!(strict_decode_base64(&huge).is_err());
+    }
+
+    #[test]
+    fn test_validate_logo_payload_rejections() {
+        // Not a data URL
+        assert!(validate_logo_payload("https://example.com/logo.png").is_err());
+
+        // SVG and HTML rejected
+        assert!(validate_logo_payload("data:image/svg+xml;base64,PHN2Zz4=").is_err());
+        assert!(validate_logo_payload("data:text/html;base64,PGh0bWw+").is_err());
+
+        // Unsupported MIME types
+        assert!(validate_logo_payload("data:image/gif;base64,R0lGODlh").is_err());
+        assert!(validate_logo_payload("data:application/pdf;base64,JVBERg==").is_err());
+
+        // Missing ;base64
+        assert!(validate_logo_payload("data:image/png,iVBORw0K").is_err());
+
+        // Signature mismatch
+        assert!(validate_logo_payload("data:image/png;base64,dGVzdGFzZGY=").is_err());
+    }
 }

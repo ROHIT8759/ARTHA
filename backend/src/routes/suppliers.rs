@@ -48,7 +48,7 @@ async fn list_suppliers(
     for row in rows {
         out.push(row?);
     }
-    
+
     Ok(Json(out))
 }
 

@@ -30,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+futures = "0.3"
 
 # Argon2 is unusably slow at opt-level 0; optimise dependencies in dev/test builds.
 [profile.dev.package."*"]

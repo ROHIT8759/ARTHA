@@ -7,8 +7,11 @@
 //! call `AuthUser::require_owner`. There is no separate "trust the frontend"
 //! path — a direct API call with a staff token hits the same check.
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::Argon2;
+use axum::async_trait;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use rusqlite::Connection;
@@ -79,7 +82,9 @@ fn add_hours_iso(iso: &str, hours: i64) -> String {
     // always called immediately after `now_iso()`.
     use std::time::{SystemTime, UNIX_EPOCH};
     let _ = iso; // created_at already captured by caller; kept for clarity/logging
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let future = now + std::time::Duration::from_secs((hours * 3600) as u64);
     crate::ids::format_unix_public(future.as_secs(), future.subsec_millis())
 }
@@ -100,10 +105,14 @@ impl AuthUser {
     }
 }
 
+#[async_trait]
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let header = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)
@@ -152,6 +161,11 @@ impl FromRequestParts<AppState> for AuthUser {
         let role = Role::from_str(&role_str)
             .ok_or_else(|| ApiError::Internal(format!("unknown role in db: {role_str}")))?;
 
-        Ok(AuthUser { user_id, business_id, username, role })
+        Ok(AuthUser {
+            user_id,
+            business_id,
+            username,
+            role,
+        })
     }
 }

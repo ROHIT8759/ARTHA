@@ -17,7 +17,10 @@ use crate::{audit, AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/setup", axum::routing::get(setup_status).post(setup_business))
+        .route(
+            "/api/setup",
+            axum::routing::get(setup_status).post(setup_business),
+        )
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", axum::routing::get(me))
@@ -43,14 +46,18 @@ async fn setup_business(
         return Err(ApiError::BadRequest("owner_username is required".into()));
     }
     if req.owner_password.len() < 8 {
-        return Err(ApiError::BadRequest("owner_password must be at least 8 characters".into()));
+        return Err(ApiError::BadRequest(
+            "owner_password must be at least 8 characters".into(),
+        ));
     }
 
     let conn = state.db.lock().expect("db mutex poisoned");
 
     let existing: i64 = conn.query_row("SELECT COUNT(*) FROM businesses", [], |r| r.get(0))?;
     if existing > 0 {
-        return Err(ApiError::Conflict("a business is already set up on this server".into()));
+        return Err(ApiError::Conflict(
+            "a business is already set up on this server".into(),
+        ));
     }
 
     let business_id = new_id();
@@ -68,7 +75,15 @@ async fn setup_business(
         rusqlite::params![user_id, business_id, req.owner_username.trim(), password_hash, ts],
     )?;
 
-    audit::record(&conn, &business_id, Some(&user_id), "setup_business", "business", Some(&business_id), "{}")?;
+    audit::record(
+        &conn,
+        &business_id,
+        Some(&user_id),
+        "setup_business",
+        "business",
+        Some(&business_id),
+        "{}",
+    )?;
 
     let (token, expires_at) = create_session(&conn, &user_id)?;
 
@@ -113,7 +128,9 @@ async fn login(
     // account doesn't leak its status to someone guessing passwords. We
     // just report the same "invalid username or password" either way below.
     if !verify_password(&req.password, &password_hash) {
-        return Err(ApiError::Unauthorized("invalid username or password".into()));
+        return Err(ApiError::Unauthorized(
+            "invalid username or password".into(),
+        ));
     }
     if status != "active" {
         return Err(ApiError::Forbidden("account disabled".into()));
@@ -153,7 +170,10 @@ async fn me(State(state): State<AppState>, user: AuthUser) -> Result<Json<UserVi
     }))
 }
 
-async fn logout(State(state): State<AppState>, user: AuthUser) -> Result<Json<serde_json::Value>, ApiError> {
+async fn logout(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let conn = state.db.lock().expect("db mutex poisoned");
     conn.execute(
         "UPDATE sessions SET revoked_at = ?1 WHERE user_id = ?2 AND revoked_at IS NULL",

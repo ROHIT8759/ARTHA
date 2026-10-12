@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { SaleView, BusinessView, formatPaise, amountToWords } from "@/lib/api";
+import { SaleView, BusinessView, formatPaise, amountToWords, computeTaxSlabs } from "@/lib/api";
 
 interface ThermalReceiptProps {
   sale: SaleView;
@@ -36,19 +36,9 @@ export default function ThermalReceipt({ sale, business }: ThermalReceiptProps) 
         timeStyle: "short",
       });
 
-  // Authoritative tax breakdown from persisted item line records
-  // Identity: taxable = line_total_paise - tax_paise
-  const taxSlabs: { [key: number]: { taxable: number; tax: number } } = {};
-  for (const item of sale.items) {
-    const lineTax = item.tax_paise;
-    const taxable = Math.max(0, item.line_total_paise - lineTax);
-
-    if (!taxSlabs[item.gst_rate_bps]) {
-      taxSlabs[item.gst_rate_bps] = { taxable: 0, tax: 0 };
-    }
-    taxSlabs[item.gst_rate_bps].taxable += taxable;
-    taxSlabs[item.gst_rate_bps].tax += lineTax;
-  }
+  // Authoritative tax breakdown from persisted item line records using shared tested helper
+  const taxSlabs = computeTaxSlabs(sale.items);
+  const slabList = Object.values(taxSlabs).sort((a, b) => a.rateBps - b.rateBps);
 
   return (
     <div
@@ -220,13 +210,16 @@ export default function ThermalReceipt({ sale, business }: ThermalReceiptProps) 
       </div>
 
       {/* Tax breakdown summary */}
-      {showTaxBreakdown && Object.keys(taxSlabs).length > 0 && (
+      {showTaxBreakdown && slabList.length > 0 && (
         <div style={{ fontSize: "10px", marginTop: "6px", borderTop: "1px dotted #888", paddingTop: "4px" }}>
           <div style={{ fontWeight: "bold" }}>GST Summary:</div>
-          {Object.entries(taxSlabs).map(([rateBps, info]) => (
-            <div key={rateBps} style={{ display: "flex", justifyContent: "space-between" }}>
-              <span>{(Number(rateBps) / 100).toFixed(0)}% on {formatPaise(info.taxable)}:</span>
-              <span>{formatPaise(info.tax)}</span>
+          {slabList.map((slab) => (
+            <div key={slab.rateBps} style={{ display: "flex", justifyContent: "space-between" }}>
+              <span>
+                {slab.rateBps % 100 === 0 ? (slab.rateBps / 100).toFixed(0) : (slab.rateBps / 100).toFixed(2)}% on{" "}
+                {formatPaise(slab.taxablePaise)}:
+              </span>
+              <span>{formatPaise(slab.taxPaise)}</span>
             </div>
           ))}
         </div>

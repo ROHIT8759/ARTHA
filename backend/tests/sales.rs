@@ -28,12 +28,12 @@
 //! 25. Audit event generation
 //! 26. Void behavior (draft cancel vs completed sale stock reversal)
 
-use std::sync::{Arc, Mutex};
 use artha_server::{build_app, db, AppState};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 fn test_app_with_state() -> (axum::Router, AppState) {
@@ -142,14 +142,37 @@ async fn test_full_sales_lifecycle_and_invariants() {
 
     // Create 2 test products with stock
     // Product 1: Rice, price ₹50 (5000 paise), 5% GST (500 bps), 10 units (10000 milli)
-    let prod1 = create_product_with_stock(&app, &token, "Basmati Rice 1kg", "QR-RICE-001", 5000, 500, 10_000).await;
+    let prod1 = create_product_with_stock(
+        &app,
+        &token,
+        "Basmati Rice 1kg",
+        "QR-RICE-001",
+        5000,
+        500,
+        10_000,
+    )
+    .await;
     // Product 2: Oil, price ₹120 (12000 paise), 18% GST (1800 bps), 5 units (5000 milli)
-    let prod2 = create_product_with_stock(&app, &token, "Cooking Oil 1L", "QR-OIL-001", 12000, 1800, 5_000).await;
+    let prod2 = create_product_with_stock(
+        &app,
+        &token,
+        "Cooking Oil 1L",
+        "QR-OIL-001",
+        12000,
+        1800,
+        5_000,
+    )
+    .await;
 
     // 5. Product QR lookup test
     let qr_resp = app
         .clone()
-        .oneshot(json_request("GET", "/api/products/by-qr/QR-RICE-001", Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            "/api/products/by-qr/QR-RICE-001",
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(qr_resp.status(), StatusCode::OK);
@@ -159,7 +182,12 @@ async fn test_full_sales_lifecycle_and_invariants() {
     // 6. Product search test
     let search_resp = app
         .clone()
-        .oneshot(json_request("GET", "/api/products?search=Cooking", Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            "/api/products?search=Cooking",
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(search_resp.status(), StatusCode::OK);
@@ -232,7 +260,12 @@ async fn test_full_sales_lifecycle_and_invariants() {
     // 4. Draft does NOT modify inventory
     let inv1 = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/inventory/{}", prod1), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", prod1),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(inv1).await["current_stock_milli"], 10_000); // Rice stock remains 10_000
@@ -276,7 +309,10 @@ async fn test_full_sales_lifecycle_and_invariants() {
     assert_eq!(finalized["status"], "completed");
     assert_eq!(finalized["payment_status"], "paid");
     assert_eq!(finalized["payment_method"], "upi");
-    assert!(finalized["invoice_no"].as_str().unwrap().starts_with("INV-"));
+    assert!(finalized["invoice_no"]
+        .as_str()
+        .unwrap()
+        .starts_with("INV-"));
     let inv_no = finalized["invoice_no"].as_str().unwrap().to_string();
 
     // 14. Price snapshots & snapshots preserved
@@ -294,14 +330,24 @@ async fn test_full_sales_lifecycle_and_invariants() {
     // 9. Inventory deduction (-quantity_milli in inventory_transactions and products table)
     let inv_rice = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/inventory/{}", prod1), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", prod1),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(inv_rice).await["current_stock_milli"], 8_000); // 10000 - 2000
 
     let inv_oil = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/inventory/{}", prod2), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", prod2),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(inv_oil).await["current_stock_milli"], 4_000); // 5000 - 1000
@@ -309,7 +355,12 @@ async fn test_full_sales_lifecycle_and_invariants() {
     // Check products cached stock
     let prod_view = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/products/{}", prod1), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/products/{}", prod1),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(prod_view).await["stock_qty_milli"], 8_000);
@@ -333,10 +384,18 @@ async fn test_full_sales_lifecycle_and_invariants() {
     // Verify stock was NOT deducted again
     let inv_rice_after = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/inventory/{}", prod1), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", prod1),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
-    assert_eq!(body_json(inv_rice_after).await["current_stock_milli"], 8_000); // Still 8000!
+    assert_eq!(
+        body_json(inv_rice_after).await["current_stock_milli"],
+        8_000
+    ); // Still 8000!
 
     // Immutable completed sale - cannot edit
     let edit_completed = app
@@ -367,11 +426,19 @@ async fn test_full_sales_lifecycle_and_invariants() {
     // Historical sale record retains original name and price snapshot
     let sale_check = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/sales/{}", sale_id), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/sales/{}", sale_id),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     let sale_check_body = body_json(sale_check).await;
-    assert_eq!(sale_check_body["items"][0]["product_name_snapshot"], "Basmati Rice 1kg");
+    assert_eq!(
+        sale_check_body["items"][0]["product_name_snapshot"],
+        "Basmati Rice 1kg"
+    );
     assert_eq!(sale_check_body["items"][0]["unit_price_paise"], 5000);
 
     // 25. Audit event generation check
@@ -394,7 +461,8 @@ async fn test_insufficient_stock_and_negative_stock_prevention() {
     let token = setup_owner(&app, "Stock Retail", "owner2").await;
 
     // Product with exactly 1 unit (1000 milli)
-    let prod = create_product_with_stock(&app, &token, "Sugar 1kg", "QR-SUGAR", 4000, 500, 1000).await;
+    let prod =
+        create_product_with_stock(&app, &token, "Sugar 1kg", "QR-SUGAR", 4000, 500, 1000).await;
 
     // Create draft requesting 2 units (2000 milli)
     let create_resp = app
@@ -402,7 +470,10 @@ async fn test_insufficient_stock_and_negative_stock_prevention() {
         .oneshot(json_request("POST", "/api/sales", Some(&token), json!({})))
         .await
         .unwrap();
-    let sale_id = body_json(create_resp).await["sale_id"].as_str().unwrap().to_string();
+    let sale_id = body_json(create_resp).await["sale_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let update_resp = app
         .clone()
@@ -421,25 +492,44 @@ async fn test_insufficient_stock_and_negative_stock_prevention() {
     // 7. Insufficient stock rejection
     let finalize_resp = app
         .clone()
-        .oneshot(json_request("POST", &format!("/api/sales/{}/finalize", sale_id), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/sales/{}/finalize", sale_id),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(finalize_resp.status(), StatusCode::BAD_REQUEST);
     let err_body = body_json(finalize_resp).await;
     let msg = err_body["message"].as_str().unwrap();
-    assert!(msg.contains("Insufficient stock for Product Sugar 1kg"), "Error message was: {}", msg);
+    assert!(
+        msg.contains("Insufficient stock for Product Sugar 1kg"),
+        "Error message was: {}",
+        msg
+    );
 
     // 10. Atomic finalization: Sale must still be in draft and inventory unmodified
     let sale_resp = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/sales/{}", sale_id), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/sales/{}", sale_id),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(sale_resp).await["status"], "draft");
 
     let inv_resp = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/inventory/{}", prod), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", prod),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(inv_resp).await["current_stock_milli"], 1000);
@@ -460,7 +550,10 @@ async fn test_invoice_number_uniqueness_and_monotonicity() {
             .oneshot(json_request("POST", "/api/sales", Some(&token), json!({})))
             .await
             .unwrap();
-        let sid = body_json(resp).await["sale_id"].as_str().unwrap().to_string();
+        let sid = body_json(resp).await["sale_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         app.clone()
             .oneshot(json_request(
@@ -476,16 +569,27 @@ async fn test_invoice_number_uniqueness_and_monotonicity() {
 
         let fin_resp = app
             .clone()
-            .oneshot(json_request("POST", &format!("/api/sales/{}/finalize", sid), Some(&token), Value::Null))
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/sales/{}/finalize", sid),
+                Some(&token),
+                Value::Null,
+            ))
             .await
             .unwrap();
         assert_eq!(fin_resp.status(), StatusCode::OK);
-        let inv = body_json(fin_resp).await["invoice_no"].as_str().unwrap().to_string();
+        let inv = body_json(fin_resp).await["invoice_no"]
+            .as_str()
+            .unwrap()
+            .to_string();
         invoice_numbers.push(inv);
     }
 
     // 13. Invoice number uniqueness and monotonicity
-    assert_eq!(invoice_numbers, vec!["INV-000001", "INV-000002", "INV-000003"]);
+    assert_eq!(
+        invoice_numbers,
+        vec!["INV-000001", "INV-000002", "INV-000003"]
+    );
 }
 
 #[tokio::test]
@@ -493,7 +597,8 @@ async fn test_void_behavior_draft_and_completed() {
     let app = test_app();
     let token = setup_owner(&app, "Void Shop", "owner4").await;
 
-    let prod = create_product_with_stock(&app, &token, "Notebook", "QR-NOTE", 5000, 1200, 10_000).await;
+    let prod =
+        create_product_with_stock(&app, &token, "Notebook", "QR-NOTE", 5000, 1200, 10_000).await;
 
     // Case 1: Void a draft sale (no inventory impact)
     let draft_resp = app
@@ -501,7 +606,10 @@ async fn test_void_behavior_draft_and_completed() {
         .oneshot(json_request("POST", "/api/sales", Some(&token), json!({})))
         .await
         .unwrap();
-    let draft_id = body_json(draft_resp).await["sale_id"].as_str().unwrap().to_string();
+    let draft_id = body_json(draft_resp).await["sale_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     app.clone()
         .oneshot(json_request(
@@ -517,7 +625,12 @@ async fn test_void_behavior_draft_and_completed() {
 
     let void_draft_resp = app
         .clone()
-        .oneshot(json_request("POST", &format!("/api/sales/{}/void", draft_id), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/sales/{}/void", draft_id),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(void_draft_resp.status(), StatusCode::OK);
@@ -526,7 +639,12 @@ async fn test_void_behavior_draft_and_completed() {
     // Inventory must remain 10_000
     let inv_resp = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/inventory/{}", prod), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", prod),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(inv_resp).await["current_stock_milli"], 10_000);
@@ -537,7 +655,10 @@ async fn test_void_behavior_draft_and_completed() {
         .oneshot(json_request("POST", "/api/sales", Some(&token), json!({})))
         .await
         .unwrap();
-    let sale_id = body_json(sale_resp).await["sale_id"].as_str().unwrap().to_string();
+    let sale_id = body_json(sale_resp).await["sale_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     app.clone()
         .oneshot(json_request(
@@ -553,7 +674,12 @@ async fn test_void_behavior_draft_and_completed() {
 
     let fin_resp = app
         .clone()
-        .oneshot(json_request("POST", &format!("/api/sales/{}/finalize", sale_id), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/sales/{}/finalize", sale_id),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(fin_resp.status(), StatusCode::OK);
@@ -561,7 +687,12 @@ async fn test_void_behavior_draft_and_completed() {
     // Stock should be 10000 - 3000 = 7000
     let inv_resp2 = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/inventory/{}", prod), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", prod),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(inv_resp2).await["current_stock_milli"], 7_000);
@@ -587,7 +718,12 @@ async fn test_void_behavior_draft_and_completed() {
     // 26. Void restores inventory ledger balance back to 10_000!
     let inv_restored = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/inventory/{}", prod), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/inventory/{}", prod),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(body_json(inv_restored).await["current_stock_milli"], 10_000);
@@ -595,7 +731,12 @@ async fn test_void_behavior_draft_and_completed() {
     // Cannot void an already void sale
     let revoid = app
         .clone()
-        .oneshot(json_request("POST", &format!("/api/sales/{}/void", sale_id), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/sales/{}/void", sale_id),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(revoid.status(), StatusCode::CONFLICT);
@@ -605,19 +746,28 @@ async fn test_void_behavior_draft_and_completed() {
 async fn test_authorization_and_cross_business_isolation() {
     let app = test_app();
     let token1 = setup_owner(&app, "Shop Alpha", "owner_alpha").await;
-    let prod_alpha = create_product_with_stock(&app, &token1, "Alpha Item", "QR-ALPHA", 1000, 0, 5000).await;
+    let prod_alpha =
+        create_product_with_stock(&app, &token1, "Alpha Item", "QR-ALPHA", 1000, 0, 5000).await;
 
     let sale_alpha_resp = app
         .clone()
         .oneshot(json_request("POST", "/api/sales", Some(&token1), json!({})))
         .await
         .unwrap();
-    let sale_alpha_id = body_json(sale_alpha_resp).await["sale_id"].as_str().unwrap().to_string();
+    let sale_alpha_id = body_json(sale_alpha_resp).await["sale_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // 20. Unauthorized access rejection
     let unauth_resp = app
         .clone()
-        .oneshot(json_request("GET", &format!("/api/sales/{}", sale_alpha_id), None, Value::Null))
+        .oneshot(json_request(
+            "GET",
+            &format!("/api/sales/{}", sale_alpha_id),
+            None,
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
@@ -648,16 +798,27 @@ async fn test_authorization_and_cross_business_isolation() {
         ))
         .await
         .unwrap();
-    let staff_token = body_json(login_resp).await["token"].as_str().unwrap().to_string();
+    let staff_token = body_json(login_resp).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Staff can create and finalize sales
     let staff_sale_resp = app
         .clone()
-        .oneshot(json_request("POST", "/api/sales", Some(&staff_token), json!({})))
+        .oneshot(json_request(
+            "POST",
+            "/api/sales",
+            Some(&staff_token),
+            json!({}),
+        ))
         .await
         .unwrap();
     assert_eq!(staff_sale_resp.status(), StatusCode::OK);
-    let staff_sale_id = body_json(staff_sale_resp).await["sale_id"].as_str().unwrap().to_string();
+    let staff_sale_id = body_json(staff_sale_resp).await["sale_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let staff_update = app
         .clone()
@@ -711,7 +872,10 @@ async fn test_archived_product_and_validation_errors() {
         .oneshot(json_request("POST", "/api/sales", Some(&token), json!({})))
         .await
         .unwrap();
-    let sale_id = body_json(sale_resp).await["sale_id"].as_str().unwrap().to_string();
+    let sale_id = body_json(sale_resp).await["sale_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // 22. Archived product rejection
     let add_arc_resp = app
@@ -773,7 +937,12 @@ async fn test_archived_product_and_validation_errors() {
     // Cannot finalize empty sale
     let fin_empty = app
         .clone()
-        .oneshot(json_request("POST", &format!("/api/sales/{}/finalize", sale_id), Some(&token), Value::Null))
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/sales/{}/finalize", sale_id),
+            Some(&token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(fin_empty.status(), StatusCode::BAD_REQUEST);

@@ -14,7 +14,9 @@ use tower::ServiceExt;
 
 fn test_app() -> axum::Router {
     let conn = db::open_in_memory();
-    let state = AppState { db: Arc::new(Mutex::new(conn)) };
+    let state = AppState {
+        db: Arc::new(Mutex::new(conn)),
+    };
     build_app(state)
 }
 
@@ -24,7 +26,10 @@ async fn body_json(resp: axum::response::Response) -> Value {
 }
 
 fn json_request(method: &str, uri: &str, token: Option<&str>, body: Value) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
     if let Some(t) = token {
         builder = builder.header("authorization", format!("Bearer {t}"));
     }
@@ -36,7 +41,16 @@ async fn full_v0_flow() {
     let app = test_app();
 
     // Health check needs no auth.
-    let resp = app.clone().oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap()).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // First setup succeeds and returns an owner session token.
@@ -84,7 +98,12 @@ async fn full_v0_flow() {
     // Staff logs in.
     let resp = app
         .clone()
-        .oneshot(json_request("POST", "/api/auth/login", None, json!({ "username": "staff1", "password": "staffpass123" })))
+        .oneshot(json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({ "username": "staff1", "password": "staffpass123" }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -134,12 +153,26 @@ async fn full_v0_flow() {
     // QR lookup resolves the product (the core of QR-first billing).
     let resp = app
         .clone()
-        .oneshot(json_request("GET", "/api/products/by-qr/QR-RICE-1KG", Some(&staff_token), Value::Null))
+        .oneshot(json_request(
+            "GET",
+            "/api/products/by-qr/QR-RICE-1KG",
+            Some(&staff_token),
+            Value::Null,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // No token at all is rejected.
-    let resp = app.clone().oneshot(Request::builder().uri("/api/products").body(Body::empty()).unwrap()).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/products")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

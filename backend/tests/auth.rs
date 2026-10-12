@@ -1,16 +1,18 @@
 //! Detailed authentication tests covering edge cases and security boundaries.
 
-use std::sync::{Arc, Mutex};
 use artha_server::{build_app, db, AppState};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 fn test_app() -> axum::Router {
     let conn = db::open_in_memory();
-    let state = AppState { db: Arc::new(Mutex::new(conn)) };
+    let state = AppState {
+        db: Arc::new(Mutex::new(conn)),
+    };
     build_app(state)
 }
 
@@ -20,7 +22,10 @@ async fn body_json(resp: axum::response::Response) -> Value {
 }
 
 fn json_request(method: &str, uri: &str, token: Option<&str>, body: Value) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
     if let Some(t) = token {
         builder = builder.header("authorization", format!("Bearer {t}"));
     }
@@ -51,60 +56,110 @@ async fn auth_edge_cases_and_security() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
     // 3. Incorrect password fails
-    let resp = app.clone().oneshot(json_request(
-        "POST",
-        "/api/auth/login",
-        None,
-        json!({ "username": "admin", "password": "wrongpassword" }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({ "username": "admin", "password": "wrongpassword" }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // 4. Nonexistent user fails
-    let resp = app.clone().oneshot(json_request(
-        "POST",
-        "/api/auth/login",
-        None,
-        json!({ "username": "nobody", "password": "password123" }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({ "username": "nobody", "password": "password123" }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Create a staff user
-    let resp = app.clone().oneshot(json_request(
-        "POST",
-        "/api/users",
-        Some(&owner_token),
-        json!({ "username": "staff1", "password": "staffpass123" }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/users",
+            Some(&owner_token),
+            json!({ "username": "staff1", "password": "staffpass123" }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let staff_id = body_json(resp).await["user_id"].as_str().unwrap().to_string();
+    let staff_id = body_json(resp).await["user_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Disable the staff user
-    let resp = app.clone().oneshot(json_request(
-        "PATCH",
-        &format!("/api/users/{}", staff_id),
-        Some(&owner_token),
-        json!({ "status": "disabled" }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/api/users/{}", staff_id),
+            Some(&owner_token),
+            json!({ "status": "disabled" }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // 5. Disabled user cannot log in
-    let resp = app.clone().oneshot(json_request(
-        "POST",
-        "/api/auth/login",
-        None,
-        json!({ "username": "staff1", "password": "staffpass123" }),
-    )).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/auth/login",
+            None,
+            json!({ "username": "staff1", "password": "staffpass123" }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // 6. Invalid session is rejected
-    let resp = app.clone().oneshot(json_request("GET", "/api/auth/me", Some("invalid_token_123"), Value::Null)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/api/auth/me",
+            Some("invalid_token_123"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // 7. Logout invalidates session
-    let resp = app.clone().oneshot(json_request("POST", "/api/auth/logout", Some(&owner_token), Value::Null)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/auth/logout",
+            Some(&owner_token),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp = app.clone().oneshot(json_request("GET", "/api/auth/me", Some(&owner_token), Value::Null)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "GET",
+            "/api/auth/me",
+            Some(&owner_token),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -114,7 +169,9 @@ async fn duplicate_setup_race_condition() {
     // However, SQLite with a mutex forces serial execution of the setup requests at the DB layer,
     // so we just test that sending multiple setups concurrently still results in only ONE success.
     let conn = db::open_in_memory();
-    let state = AppState { db: Arc::new(Mutex::new(conn)) };
+    let state = AppState {
+        db: Arc::new(Mutex::new(conn)),
+    };
     let app = build_app(state);
 
     let mut futures = vec![];

@@ -42,7 +42,11 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
-        (status, Json(json!({ "error": status.as_str(), "message": message }))).into_response()
+        (
+            status,
+            Json(json!({ "error": status.as_str(), "message": message })),
+        )
+            .into_response()
     }
 }
 

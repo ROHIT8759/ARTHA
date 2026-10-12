@@ -12,8 +12,8 @@ use crate::auth::AuthUser;
 use crate::error::ApiError;
 use crate::ids::{new_id, now_iso};
 use crate::models::{
-    CreateSaleRequest, FinalizeSaleRequest, ListSalesQuery, PaymentView, SaleItemView,
-    SaleView, UpdateSaleItemRequest, UpdateSaleRequest, VoidSaleRequest,
+    CreateSaleRequest, FinalizeSaleRequest, ListSalesQuery, PaymentView, SaleItemView, SaleView,
+    UpdateSaleItemRequest, UpdateSaleRequest, VoidSaleRequest,
 };
 use crate::AppState;
 
@@ -125,7 +125,9 @@ fn calculate_sale_items(
     bill_discount_paise: i64,
 ) -> Result<(Vec<SaleItemView>, i64, i64, i64, i64), ApiError> {
     if bill_discount_paise < 0 {
-        return Err(ApiError::BadRequest("Bill discount cannot be negative".into()));
+        return Err(ApiError::BadRequest(
+            "Bill discount cannot be negative".into(),
+        ));
     }
 
     let mut calculated_items = Vec::new();
@@ -135,7 +137,9 @@ fn calculate_sale_items(
 
     for item in items {
         if item.quantity_milli <= 0 {
-            return Err(ApiError::BadRequest("Item quantity must be greater than zero".into()));
+            return Err(ApiError::BadRequest(
+                "Item quantity must be greater than zero".into(),
+            ));
         }
 
         // Query product catalog for validation & historical snapshot values
@@ -151,7 +155,16 @@ fn calculate_sale_items(
                 "SELECT name, batch, hsn_code, gst_rate_bps, price_paise, status \
                  FROM products WHERE business_id = ?1 AND product_id = ?2",
                 rusqlite::params![business_id, item.product_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .map_err(|_| ApiError::NotFound(format!("Product '{}' not found", item.product_id)))?;
 
@@ -164,17 +177,22 @@ fn calculate_sale_items(
 
         let unit_price = item.unit_price_paise.unwrap_or(catalog_price);
         if unit_price < 0 {
-            return Err(ApiError::BadRequest("Unit price must be non-negative".into()));
+            return Err(ApiError::BadRequest(
+                "Unit price must be non-negative".into(),
+            ));
         }
 
         let line_disc = item.discount_paise.unwrap_or(0);
         if line_disc < 0 {
-            return Err(ApiError::BadRequest("Line discount must be non-negative".into()));
+            return Err(ApiError::BadRequest(
+                "Line discount must be non-negative".into(),
+            ));
         }
 
         // Exact integer calculation:
         // line_subtotal = (quantity_milli * unit_price + 500) / 1000  (round to nearest paise)
-        let line_subtotal = ((item.quantity_milli as i128 * unit_price as i128 + 500) / 1000) as i64;
+        let line_subtotal =
+            ((item.quantity_milli as i128 * unit_price as i128 + 500) / 1000) as i64;
         if line_disc > line_subtotal {
             return Err(ApiError::BadRequest(format!(
                 "Line discount cannot exceed line subtotal for '{}'",
@@ -208,7 +226,9 @@ fn calculate_sale_items(
 
     let total_discount = line_discounts_total + bill_discount_paise;
     if total_discount > subtotal && !calculated_items.is_empty() {
-        return Err(ApiError::BadRequest("Total discount cannot exceed subtotal".into()));
+        return Err(ApiError::BadRequest(
+            "Total discount cannot exceed subtotal".into(),
+        ));
     }
 
     let grand_total = (subtotal - total_discount + tax_total).max(0);
@@ -236,7 +256,8 @@ async fn list_sales(
                    created_at, updated_at, finalized_at \
                    FROM sales WHERE business_id = ?1".to_string();
 
-    let mut params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::from(user.business_id.clone())];
+    let mut params: Vec<rusqlite::types::Value> =
+        vec![rusqlite::types::Value::from(user.business_id.clone())];
 
     if let Some(st) = &query.status {
         if !st.trim().is_empty() {
@@ -247,7 +268,9 @@ async fn list_sales(
 
     if let Some(s) = &query.search {
         if !s.trim().is_empty() {
-            sql.push_str(" AND (invoice_no LIKE ? OR customer_name LIKE ? OR customer_phone LIKE ?)");
+            sql.push_str(
+                " AND (invoice_no LIKE ? OR customer_name LIKE ? OR customer_phone LIKE ?)",
+            );
             let pattern = format!("%{}%", s.trim());
             params.push(rusqlite::types::Value::from(pattern.clone()));
             params.push(rusqlite::types::Value::from(pattern.clone()));
@@ -369,6 +392,7 @@ async fn create_sale(
 }
 
 /// PATCH /api/sales/:id - Update draft sale (items, customer info, server-side totals calculation)
+#[allow(clippy::type_complexity)]
 async fn update_sale(
     State(state): State<AppState>,
     user: AuthUser,
@@ -378,7 +402,17 @@ async fn update_sale(
     let mut conn = state.db.lock().expect("db mutex poisoned");
     let tx = conn.transaction()?;
 
-    let (status, current_discount, current_customer_name, current_customer_phone, current_customer_email, current_customer_address, current_customer_gstin, current_pay_method, current_notes): (
+    let (
+        status,
+        current_discount,
+        current_customer_name,
+        current_customer_phone,
+        current_customer_email,
+        current_customer_address,
+        current_customer_gstin,
+        current_pay_method,
+        current_notes,
+    ): (
         String,
         i64,
         Option<String>,
@@ -394,7 +428,19 @@ async fn update_sale(
              customer_address, customer_gstin, payment_method, notes \
              FROM sales WHERE sale_id = ?1 AND business_id = ?2",
             rusqlite::params![id, user.business_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            },
         )
         .map_err(|_| ApiError::NotFound("Sale not found".into()))?;
 
@@ -423,7 +469,10 @@ async fn update_sale(
 
     // If items are provided in update, rebuild them and recalculate authoritative totals
     let (subtotal, total_discount, tax_total, grand_total) = if let Some(items) = req.items {
-        tx.execute("DELETE FROM sale_items WHERE sale_id = ?1", rusqlite::params![id])?;
+        tx.execute(
+            "DELETE FROM sale_items WHERE sale_id = ?1",
+            rusqlite::params![id],
+        )?;
 
         let (calc_items, sub, disc, tax, grand) =
             calculate_sale_items(&tx, &user.business_id, &items, bill_discount)?;
@@ -529,7 +578,9 @@ async fn finalize_sale(
     }
 
     if existing_status != "draft" {
-        return Err(ApiError::BadRequest("Only draft sales can be finalized".into()));
+        return Err(ApiError::BadRequest(
+            "Only draft sales can be finalized".into(),
+        ));
     }
 
     let tx = conn.transaction()?;
@@ -547,9 +598,12 @@ async fn finalize_sale(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
 
     if items.is_empty() {
-        return Err(ApiError::BadRequest("Cannot finalize a sale with no items".into()));
+        return Err(ApiError::BadRequest(
+            "Cannot finalize a sale with no items".into(),
+        ));
     }
 
     // 1. Authoritative inventory validation & active product check
@@ -560,7 +614,9 @@ async fn finalize_sale(
                 rusqlite::params![user.business_id, prod_id],
                 |r| r.get(0),
             )
-            .map_err(|_| ApiError::BadRequest(format!("Product '{}' no longer exists", prod_name)))?;
+            .map_err(|_| {
+                ApiError::BadRequest(format!("Product '{}' no longer exists", prod_name))
+            })?;
 
         if prod_status != "active" {
             return Err(ApiError::BadRequest(format!(
@@ -624,7 +680,9 @@ async fn finalize_sale(
 
     let payment_amount = finalize_req.amount_paise.unwrap_or(grand_total);
     if payment_amount < grand_total {
-        return Err(ApiError::BadRequest("Payment amount is less than grand total".into()));
+        return Err(ApiError::BadRequest(
+            "Payment amount is less than grand total".into(),
+        ));
     }
 
     // 4. Update sale to completed
@@ -632,7 +690,14 @@ async fn finalize_sale(
         "UPDATE sales SET invoice_no = ?1, status = 'completed', payment_method = ?2, \
          payment_status = 'paid', finalized_by = ?3, finalized_at = ?4, updated_at = ?4 \
          WHERE sale_id = ?5 AND business_id = ?6",
-        rusqlite::params![invoice_no, payment_method, user.user_id, now, id, user.business_id],
+        rusqlite::params![
+            invoice_no,
+            payment_method,
+            user.user_id,
+            now,
+            id,
+            user.business_id
+        ],
     )?;
 
     // 5. Deduct inventory through Phase 05 inventory_transactions ledger atomically
@@ -749,9 +814,8 @@ async fn void_sale(
         )?;
     } else if status == "completed" {
         // Reverse inventory ledger for all items
-        let mut stmt = tx.prepare(
-            "SELECT product_id, quantity_milli FROM sale_items WHERE sale_id = ?1",
-        )?;
+        let mut stmt =
+            tx.prepare("SELECT product_id, quantity_milli FROM sale_items WHERE sale_id = ?1")?;
         let items = stmt
             .query_map(rusqlite::params![id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -779,7 +843,11 @@ async fn void_sale(
                     prod_id,
                     qty,
                     id,
-                    format!("Void sale {}: {}", invoice_no.as_deref().unwrap_or(&id), reason),
+                    format!(
+                        "Void sale {}: {}",
+                        invoice_no.as_deref().unwrap_or(&id),
+                        reason
+                    ),
                     user.user_id,
                     now,
                 ],

@@ -21,6 +21,7 @@ impl Role {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Role> {
         match s {
             "owner" => Some(Role::Owner),
@@ -267,5 +268,3 @@ pub struct UpdateBusinessRequest {
 pub struct UploadLogoRequest {
     pub logo_data_url: String,
 }
-
-

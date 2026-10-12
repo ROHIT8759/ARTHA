@@ -22,7 +22,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/users/:user_id/disable", post(disable_user))
 }
 
-async fn list_users(State(state): State<AppState>, user: AuthUser) -> Result<Json<Vec<UserView>>, ApiError> {
+async fn list_users(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<Vec<UserView>>, ApiError> {
     user.require_owner()?;
     let conn = state.db.lock().expect("db mutex poisoned");
 
@@ -57,7 +60,9 @@ async fn create_staff(
         return Err(ApiError::BadRequest("username is required".into()));
     }
     if req.password.len() < 8 {
-        return Err(ApiError::BadRequest("password must be at least 8 characters".into()));
+        return Err(ApiError::BadRequest(
+            "password must be at least 8 characters".into(),
+        ));
     }
 
     let conn = state.db.lock().expect("db mutex poisoned");
@@ -81,7 +86,15 @@ async fn create_staff(
         rusqlite::params![new_user_id, user.business_id, req.username.trim(), password_hash, ts],
     )?;
 
-    audit::record(&conn, &user.business_id, Some(&user.user_id), "create_staff", "user", Some(&new_user_id), "{}")?;
+    audit::record(
+        &conn,
+        &user.business_id,
+        Some(&user.user_id),
+        "create_staff",
+        "user",
+        Some(&new_user_id),
+        "{}",
+    )?;
 
     Ok(Json(UserView {
         user_id: new_user_id,
@@ -105,10 +118,14 @@ async fn update_user_status(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     user.require_owner()?;
     if req.status != "active" && req.status != "disabled" {
-        return Err(ApiError::BadRequest("status must be 'active' or 'disabled'".into()));
+        return Err(ApiError::BadRequest(
+            "status must be 'active' or 'disabled'".into(),
+        ));
     }
     if target_user_id == user.user_id && req.status == "disabled" {
-        return Err(ApiError::BadRequest("cannot disable your own account".into()));
+        return Err(ApiError::BadRequest(
+            "cannot disable your own account".into(),
+        ));
     }
 
     let conn = state.db.lock().expect("db mutex poisoned");
@@ -141,5 +158,13 @@ async fn disable_user(
     user: AuthUser,
     path: Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    update_user_status(state, user, path, Json(UpdateUserStatusRequest { status: "disabled".into() })).await
+    update_user_status(
+        state,
+        user,
+        path,
+        Json(UpdateUserStatusRequest {
+            status: "disabled".into(),
+        }),
+    )
+    .await
 }
