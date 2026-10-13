@@ -12,9 +12,13 @@ const API_BASE =
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** Any extra JSON fields the backend sent alongside `message`/`error`
+   *  (e.g. `safety_backup_id` on a restore-failure response). */
+  details?: Record<string, unknown>;
+  constructor(status: number, message: string, details?: Record<string, unknown>) {
     super(message);
     this.status = status;
+    this.details = details;
   }
 }
 
@@ -52,7 +56,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     const message = (data && (data.message as string)) || res.statusText;
-    throw new ApiError(res.status, message);
+    const details = data && typeof data === "object" ? (data as Record<string, unknown>) : undefined;
+    throw new ApiError(res.status, message, details);
   }
   return data as T;
 }
@@ -296,10 +301,12 @@ export const api = {
     request<BackupVerifyResult>(`/api/backups/${backupId}/verify`, { method: "POST" }),
 
   restoreBackup: (backupId: string, confirm: boolean) =>
-    request<{ status: string; restored_backup_id: string; safety_backup_id: string }>(
-      `/api/backups/${backupId}/restore`,
-      { method: "POST", body: JSON.stringify({ confirm }) }
-    ),
+    request<{
+      status: string;
+      restored_backup_id: string;
+      safety_backup_id: string;
+      current_session_still_valid: boolean;
+    }>(`/api/backups/${backupId}/restore`, { method: "POST", body: JSON.stringify({ confirm }) }),
 };
 
 export interface BackupView {
@@ -558,5 +565,27 @@ export function formatBytes(bytes: number): string {
     unitIndex += 1;
   }
   return `${value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+/**
+ * Builds the recovery-guidance text shown after a failed restore attempt.
+ * A restore failure response (`ApiError.details.safety_backup_id`) means a
+ * mandatory safety backup of the pre-restore state was already taken before
+ * the failure — this appends that id to the error message so the owner
+ * isn't left with only a generic failure string when there's a concrete,
+ * actionable next step.
+ */
+export function formatRestoreErrorMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    const safetyId =
+      err.details && typeof err.details.safety_backup_id === "string"
+        ? (err.details.safety_backup_id as string)
+        : undefined;
+    if (safetyId) {
+      return `${err.message} A safety backup of your pre-restore data is available (id: ${safetyId}) — restore that to recover.`;
+    }
+    return err.message;
+  }
+  return err instanceof Error ? err.message : "Failed to restore backup";
 }
 

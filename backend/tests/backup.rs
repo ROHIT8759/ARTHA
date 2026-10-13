@@ -427,15 +427,65 @@ async fn verify_detects_non_sqlite_corruption_and_restore_refuses_it() {
 }
 
 #[tokio::test]
-async fn restore_refuses_a_backup_claiming_a_newer_schema_version() {
-    let (app, state) = test_app_with_state("schema_incompatible");
+async fn restore_refuses_a_backup_whose_verified_file_has_a_newer_schema_version() {
+    let (app, state) = test_app_with_state("schema_incompatible_file");
+    let token = setup_owner(&app).await;
+    let backup = create_backup_via_api(&app, &token).await;
+    let backup_id = backup["backup_id"].as_str().unwrap().to_string();
+    let path = backup["path"].as_str().unwrap().to_string();
+
+    // Fabricate a genuinely "newer" schema version inside the backup FILE
+    // itself (not just its metadata row), so the compatibility gate — which
+    // now reads from the verified file, not the stored row — has something
+    // real to reject.
+    {
+        let file_conn = rusqlite::Connection::open(&path).unwrap();
+        file_conn
+            .execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (999999, '2099-01-01T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+    }
+    // The file changed, so its checksum must be recomputed and the stored
+    // row updated to match it — otherwise this would (correctly) fail on
+    // checksum mismatch instead of exercising the schema-version gate.
+    let new_checksum = {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(&path).unwrap();
+        hex::encode(Sha256::digest(&bytes))
+    };
+    {
+        let conn = state.db.lock().unwrap();
+        conn.execute(
+            "UPDATE backups SET checksum_sha256 = ?1 WHERE backup_id = ?2",
+            rusqlite::params![new_checksum, backup_id],
+        )
+        .unwrap();
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/backups/{backup_id}/restore"),
+            Some(&token),
+            json!({ "confirm": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn restore_compatibility_check_uses_the_verified_file_not_the_metadata_row() {
+    let (app, state) = test_app_with_state("schema_metadata_mismatch");
     let token = setup_owner(&app).await;
     let backup = create_backup_via_api(&app, &token).await;
     let backup_id = backup["backup_id"].as_str().unwrap().to_string();
 
-    // Fabricate an impossible schema_version on the backup row (the backup
-    // file itself is untouched and still passes checksum/integrity) to
-    // exercise the compatibility gate in isolation.
+    // Tamper ONLY the stored metadata row. The backup file itself (and its
+    // checksum) are untouched and genuinely compatible.
     {
         let conn = state.db.lock().unwrap();
         conn.execute(
@@ -455,7 +505,14 @@ async fn restore_refuses_a_backup_claiming_a_newer_schema_version() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    // The compatibility decision must come from the verified file (truly
+    // compatible), never from a tampered metadata row (falsely
+    // incompatible) — this is the one-line fix for Finding 6.
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a tampered metadata row must not override the verified file's real schema version"
+    );
 }
 
 #[tokio::test]
@@ -526,4 +583,214 @@ async fn retention_prunes_oldest_backups_beyond_the_configured_limit() {
     assert!(remaining_ids.contains(&ids[3]));
     assert!(!remaining_ids.contains(&ids[0]));
     assert!(!remaining_ids.contains(&ids[1]));
+}
+
+// --- Remediation regression tests (production-safety review findings) ---
+
+#[tokio::test]
+async fn retention_pruning_never_deletes_the_restore_target() {
+    // retention=2, and we take exactly 2 backups -- right at the boundary.
+    // Restoring the older one forces a 3rd (safety) backup, which, without
+    // the Finding-1 fix, would prune the older one as the new 3rd-oldest.
+    let (app, _state) = test_app_with_retention("retention_restore_target", 2);
+    let token = setup_owner(&app).await;
+
+    let backup_a = create_backup_via_api(&app, &token).await;
+    let id_a = backup_a["backup_id"].as_str().unwrap().to_string();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    create_backup_via_api(&app, &token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/backups/{id_a}/restore"),
+            Some(&token),
+            json!({ "confirm": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "restoring a backup at the retention boundary must succeed, not fail because its own \
+         safety backup pruned it out from under the restore"
+    );
+
+    let after = list_backups(&app, &token).await;
+    assert!(
+        after.iter().any(|b| b["backup_id"] == id_a),
+        "restore target must remain discoverable and intact after restore"
+    );
+}
+
+#[tokio::test]
+async fn restore_to_a_pre_setup_backup_still_reports_success_despite_audit_fk_failure() {
+    // Simulates the scheduler taking a backup before `/api/setup` has ever
+    // run (entirely possible: the scheduler backs up whatever is live on
+    // its own timer, regardless of setup state). Restoring to it later
+    // wipes the businesses/users/sessions tables the current owner session
+    // depends on, which can make the final post-restore audit write fail
+    // its foreign-key check. That must never surface as "restore failed".
+    let conn = db::open_in_memory();
+    let mut state = AppState::for_tests(conn);
+    state.backup_dir = unique_backup_dir("pre_setup_restore");
+
+    let pre_setup_backup = artha_server::routes::backup::create_backup(&state)
+        .expect("pre-setup backup should succeed");
+
+    let app = build_app(state.clone());
+    let token = setup_owner(&app).await;
+    create_product(&app, &token, "Rice", "QR-RICE").await;
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/backups/{}/restore", pre_setup_backup.backup_id),
+            Some(&token),
+            json!({ "confirm": true }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "restoring to a pre-setup backup must still report success even though the post-restore \
+         audit write cannot succeed (the business/user rows it would reference no longer exist)"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], "restored");
+    assert_eq!(
+        body["current_session_still_valid"], false,
+        "the response must clearly flag that the pre-restore session is no longer valid"
+    );
+
+    // Confirm the database really was reverted to the pre-setup state.
+    let setup_status = app
+        .clone()
+        .oneshot(json_request("GET", "/api/setup", None, Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(body_json(setup_status).await["exists"], false);
+}
+
+#[tokio::test]
+async fn restore_preserves_metadata_for_all_valid_backups_not_just_the_two_involved() {
+    let (app, _state) = test_app_with_state("preserve_all_metadata");
+    let token = setup_owner(&app).await;
+
+    // Three independent backups exist before any restore happens.
+    let backup_1 = create_backup_via_api(&app, &token).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let backup_2 = create_backup_via_api(&app, &token).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let backup_3 = create_backup_via_api(&app, &token).await;
+    let id_1 = backup_1["backup_id"].as_str().unwrap().to_string();
+    let id_2 = backup_2["backup_id"].as_str().unwrap().to_string();
+    let id_3 = backup_3["backup_id"].as_str().unwrap().to_string();
+
+    // Restore to the OLDEST (backup_1), whose own snapshot predates
+    // backup_2 and backup_3 entirely.
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/backups/{id_1}/restore"),
+            Some(&token),
+            json!({ "confirm": true }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let after = list_backups(&app, &token).await;
+    let after_ids: Vec<String> = after
+        .iter()
+        .map(|b| b["backup_id"].as_str().unwrap().to_string())
+        .collect();
+
+    assert!(
+        after_ids.contains(&id_1),
+        "restore target must remain listed"
+    );
+    assert!(
+        after_ids.contains(&id_2),
+        "backup_2, taken before the restore and not part of the restored snapshot, must remain listed"
+    );
+    assert!(
+        after_ids.contains(&id_3),
+        "backup_3, taken before the restore and not part of the restored snapshot, must remain listed"
+    );
+    // Plus the mandatory safety backup taken during this restore.
+    assert_eq!(
+        after.len(),
+        4,
+        "backup_1, backup_2, backup_3, and the new safety backup"
+    );
+
+    // And every re-asserted backup must still verify cleanly -- the
+    // re-assertion step only restores bookkeeping rows for files that were
+    // already valid a moment earlier, never re-registering anything new.
+    for id in [&id_1, &id_2, &id_3] {
+        let resp = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/api/backups/{id}/verify"),
+                Some(&token),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        let verify = body_json(resp).await;
+        assert_eq!(
+            verify["valid"], true,
+            "backup {id} must still verify as valid after restore"
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_request_during_restore_never_observes_a_mid_migration_schema() {
+    // Best-effort, non-deterministic coverage: this test cannot reliably
+    // force a request into the (now-eliminated) gap between the
+    // restore-copy and the re-migration step, because both happen under one
+    // continuous mutex hold with no intentional delay to race against on an
+    // in-memory database this small. The authoritative guarantee is
+    // structural: `restore_backup_handler` holds a single `MutexGuard`
+    // across `Backup::run_to_completion`, `db::run_migrations`, and the
+    // post-restore `integrity_check` (see that function's body) -- so no
+    // other handler's `state.db.lock()` call can succeed until all three
+    // finish. This test is a smoke-level cross-check only: whichever order
+    // the mutex actually serializes these two requests in, the concurrent
+    // read must complete cleanly, never with a raw SQL/schema error from
+    // touching a half-migrated database.
+    let (app, _state) = test_app_with_state("concurrent_restore");
+    let token = setup_owner(&app).await;
+    create_product(&app, &token, "Rice", "QR-RICE").await;
+    let backup = create_backup_via_api(&app, &token).await;
+    let backup_id = backup["backup_id"].as_str().unwrap().to_string();
+
+    let restore_fut = app.clone().oneshot(json_request(
+        "POST",
+        &format!("/api/backups/{backup_id}/restore"),
+        Some(&token),
+        json!({ "confirm": true }),
+    ));
+    let concurrent_fut = app.clone().oneshot(json_request(
+        "GET",
+        "/api/products",
+        Some(&token),
+        Value::Null,
+    ));
+
+    let (restore_resp, concurrent_resp) = tokio::join!(restore_fut, concurrent_fut);
+    assert_eq!(restore_resp.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        concurrent_resp.unwrap().status(),
+        StatusCode::OK,
+        "a request concurrent with restore must never see a broken/erroring database"
+    );
 }

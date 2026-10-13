@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef } from "react";
 import { useAuth } from "@/lib/auth-context";
-import { api, BusinessView, BackupView, BackupVerifyResult, formatBytes } from "@/lib/api";
+import { api, setToken, BusinessView, BackupView, BackupVerifyResult, formatBytes, formatRestoreErrorMessage } from "@/lib/api";
 import LoadingState from "@/components/ui/LoadingState";
 import ErrorState from "@/components/ui/ErrorState";
 
@@ -43,6 +43,7 @@ export default function SettingsPage() {
   const [backupsError, setBackupsError] = useState<string | null>(null);
   const [creatingBackup, setCreatingBackup] = useState(false);
   const [backupActionId, setBackupActionId] = useState<string | null>(null);
+  const [backupActionKind, setBackupActionKind] = useState<"verify" | "restore" | null>(null);
   const [verifyResults, setVerifyResults] = useState<Record<string, BackupVerifyResult>>({});
   const [backupFeedback, setBackupFeedback] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
@@ -152,6 +153,7 @@ export default function SettingsPage() {
 
   const handleVerifyBackup = async (backupId: string) => {
     setBackupActionId(backupId);
+    setBackupActionKind("verify");
     setBackupFeedback(null);
     try {
       const result = await api.verifyBackup(backupId);
@@ -163,6 +165,7 @@ export default function SettingsPage() {
       });
     } finally {
       setBackupActionId(null);
+      setBackupActionKind(null);
     }
   };
 
@@ -176,23 +179,47 @@ export default function SettingsPage() {
     if (!confirmed) return;
 
     setBackupActionId(backup.backup_id);
+    setBackupActionKind("restore");
     setBackupFeedback(null);
     try {
       const result = await api.restoreBackup(backup.backup_id, true);
-      setBackupFeedback({
-        type: "success",
-        text: `Database restored. A safety backup of the prior state was saved (id: ${result.safety_backup_id}). Reloading...`,
-      });
-      // Virtually every piece of app state (products, sales, settings, auth
-      // session rows) may have just changed underneath the running app;
-      // a full reload is the only way to guarantee nothing stale is shown.
-      setTimeout(() => window.location.reload(), 1500);
+      if (result.current_session_still_valid) {
+        setBackupFeedback({
+          type: "success",
+          text: `Database restored. A safety backup of the prior state was saved (id: ${result.safety_backup_id}). Reloading...`,
+        });
+        // Virtually every piece of app state (products, sales, settings)
+        // may have just changed underneath the running app; a full reload
+        // is the only way to guarantee nothing stale is shown.
+        setTimeout(() => window.location.reload(), 1500);
+      } else {
+        // The restore replaced the businesses/users/sessions tables with an
+        // older snapshot that predates this account (or predates setup
+        // entirely) — the current login no longer exists post-restore.
+        // Reloading would just bounce to an unexplained login screen, so
+        // tell the owner plainly first, then send them to re-authenticate
+        // (or redo setup, if the restored snapshot predates it).
+        setBackupFeedback({
+          type: "success",
+          text: `Database restored to an earlier state. A safety backup of the prior state was saved (id: ${result.safety_backup_id}). Your current login no longer exists in the restored data — redirecting to sign in again...`,
+        });
+        setTimeout(() => {
+          setToken(null);
+          // A deliberate hard navigation, not client-side routing: a
+          // restore can also invalidate in-memory AuthContext state, so a
+          // full reload is needed here for the same reason as the
+          // reload-on-success branch above.
+          // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+          window.location.href = "/login";
+        }, 2500);
+      }
     } catch (err: unknown) {
       setBackupFeedback({
         type: "error",
-        text: err instanceof Error ? err.message : "Failed to restore backup",
+        text: formatRestoreErrorMessage(err),
       });
       setBackupActionId(null);
+      setBackupActionKind(null);
     }
   };
 
@@ -625,6 +652,8 @@ export default function SettingsPage() {
               {backups.map((b) => {
                 const verify = verifyResults[b.backup_id];
                 const busy = backupActionId === b.backup_id;
+                const verifying = busy && backupActionKind === "verify";
+                const restoring = busy && backupActionKind === "restore";
                 return (
                   <tr key={b.backup_id}>
                     <td>{new Date(b.created_at).toLocaleString()}</td>
@@ -651,7 +680,7 @@ export default function SettingsPage() {
                           disabled={busy}
                           onClick={() => handleVerifyBackup(b.backup_id)}
                         >
-                          {busy && backupActionId === b.backup_id ? "..." : "Verify"}
+                          {verifying ? "..." : "Verify"}
                         </button>
                         <button
                           type="button"
@@ -660,7 +689,7 @@ export default function SettingsPage() {
                           style={{ color: "var(--danger)", borderColor: "var(--danger)" }}
                           onClick={() => handleRestoreBackup(b)}
                         >
-                          Restore
+                          {restoring ? "Restoring..." : "Restore"}
                         </button>
                       </div>
                     </td>

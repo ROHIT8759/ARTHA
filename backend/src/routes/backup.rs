@@ -77,6 +77,19 @@ fn current_schema_version(conn: &Connection) -> Result<i64, ApiError> {
 /// synchronous file and SQLite work while briefly holding the shared db
 /// mutex, exactly like every other handler in this codebase.
 pub fn create_backup(state: &AppState) -> Result<BackupView, ApiError> {
+    create_backup_preserving(state, &[])
+}
+
+/// Same as `create_backup`, but the retention prune that follows will never
+/// delete a backup whose id appears in `preserve_ids` — regardless of how
+/// old it is — even if every other backup would otherwise be eligible.
+/// Used by restore so that taking the mandatory safety backup can never
+/// delete the very backup being restored (see the production-safety review,
+/// Finding 1).
+fn create_backup_preserving(
+    state: &AppState,
+    preserve_ids: &[&str],
+) -> Result<BackupView, ApiError> {
     std::fs::create_dir_all(&state.backup_dir)
         .map_err(|e| ApiError::Internal(format!("failed to create backup dir: {e}")))?;
 
@@ -120,7 +133,7 @@ pub fn create_backup(state: &AppState) -> Result<BackupView, ApiError> {
         )?;
     }
 
-    prune_old_backups(state)?;
+    prune_old_backups(state, preserve_ids)?;
 
     Ok(BackupView {
         backup_id,
@@ -133,11 +146,15 @@ pub fn create_backup(state: &AppState) -> Result<BackupView, ApiError> {
     })
 }
 
-/// Keeps the most recent `backup_retention` backups (by `created_at`),
-/// deleting older rows and their files. Always keeps at least 1 regardless
-/// of configuration, so a misconfigured `ARTHA_BACKUP_RETENTION=0` can never
-/// delete the backup that was just taken.
-fn prune_old_backups(state: &AppState) -> Result<(), ApiError> {
+/// Keeps the most recent `backup_retention` non-preserved backups (by
+/// `created_at`), deleting older rows and their files. Always keeps at
+/// least 1 regardless of configuration, so a misconfigured
+/// `ARTHA_BACKUP_RETENTION=0` can never delete the backup that was just
+/// taken. Anything in `preserve_ids` is kept unconditionally and does not
+/// consume a slot in the retention budget — it can push the total count
+/// above `backup_retention`, which is intentional: we never force-delete a
+/// backup we were explicitly told to keep just to hit a count target.
+fn prune_old_backups(state: &AppState, preserve_ids: &[&str]) -> Result<(), ApiError> {
     let effective_retention = state.backup_retention.max(1);
     let conn = state.db.lock().expect("db mutex poisoned");
 
@@ -147,7 +164,15 @@ fn prune_old_backups(state: &AppState) -> Result<(), ApiError> {
         .collect::<Result<_, _>>()?;
     drop(stmt);
 
-    for (backup_id, path) in rows.into_iter().skip(effective_retention) {
+    let mut kept = 0usize;
+    for (backup_id, path) in rows {
+        if preserve_ids.contains(&backup_id.as_str()) {
+            continue;
+        }
+        if kept < effective_retention {
+            kept += 1;
+            continue;
+        }
         // Best-effort file removal; the database row is the source of truth
         // for what "exists" means, so a stray orphaned file on disk is a
         // harmless leftover rather than a correctness problem.
@@ -159,6 +184,34 @@ fn prune_old_backups(state: &AppState) -> Result<(), ApiError> {
     }
 
     Ok(())
+}
+
+/// Reads every backup row currently in the live `backups` table. Used by
+/// restore to remember, before the destructive copy overwrites that table
+/// with an older snapshot's own version of it, exactly which backups validly
+/// existed a moment ago — so they can all be re-asserted afterward, not just
+/// the two rows directly involved in the restore itself (see the
+/// production-safety review, Finding 4). This only re-reads rows that were
+/// already present in the live table a moment earlier; it never re-verifies
+/// or re-registers arbitrary files, so nothing unverified can be newly
+/// introduced by the re-assertion step.
+fn snapshot_all_backup_rows(state: &AppState) -> Result<Vec<BackupView>, ApiError> {
+    let conn = state.db.lock().expect("db mutex poisoned");
+    let mut stmt = conn.prepare(
+        "SELECT backup_id, app_version, schema_version, path, checksum_sha256, created_at FROM backups",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(BackupView {
+            backup_id: r.get(0)?,
+            app_version: r.get(1)?,
+            schema_version: r.get(2)?,
+            path: r.get(3)?,
+            checksum_sha256: r.get(4)?,
+            created_at: r.get(5)?,
+            size_bytes: 0,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 /// Checks a backup file's checksum, SQLite integrity, and records its own
@@ -314,10 +367,15 @@ async fn restore_backup_handler(
     };
     let path = restored_row.path.clone();
     let checksum = restored_row.checksum_sha256.clone();
-    let backup_schema_version = restored_row.schema_version;
 
     // 1. Validate the target backup before touching anything live: checksum,
-    // SQLite integrity, and schema compatibility.
+    // SQLite integrity, and schema compatibility. The compatibility decision
+    // uses `verify.schema_version` — independently re-derived by opening the
+    // just-checksummed, just-integrity-checked file itself — rather than the
+    // `schema_version` column on the `backups` row. That column isn't
+    // protected by the checksum (which covers only the backup file's bytes),
+    // so basing the safety decision on the verified file keeps the whole
+    // compatibility gate derived from data that was actually just verified.
     let verify = verify_backup_file(Path::new(&path), &checksum)?;
     if !verify.checksum_ok {
         return Err(ApiError::BadRequest(
@@ -330,82 +388,121 @@ async fn restore_backup_handler(
             "Backup failed SQLite integrity check; refusing to restore".into(),
         ));
     }
+    let verified_backup_schema_version = verify.schema_version.unwrap_or(0);
 
     let live_schema_version = {
         let conn = state.db.lock().expect("db mutex poisoned");
         current_schema_version(&conn)?
     };
 
-    if backup_schema_version > live_schema_version {
+    if verified_backup_schema_version > live_schema_version {
         return Err(ApiError::Conflict(format!(
-            "Backup schema version ({backup_schema_version}) is newer than this application's \
+            "Backup schema version ({verified_backup_schema_version}) is newer than this application's \
              schema version ({live_schema_version}); refusing to restore data from a newer app version"
         )));
     }
 
     // 2. Safety backup of current live state, taken before any destructive
     // action, per spec §10 ("create a safety backup of the current state").
-    let safety_backup = create_backup(&state)?;
+    // The restore target (`id`) is explicitly preserved from this backup's
+    // own retention pruning, so taking the safety backup can never delete
+    // the very backup about to be restored from (production-safety review,
+    // Finding 1).
+    let safety_backup = create_backup_preserving(&state, &[&id])?;
 
-    // 3. Restore: copy the backup file's pages into the live, already-open
+    // Snapshot every backup row that validly exists right now — after the
+    // safety backup and its retention pruning, so this reflects reality, not
+    // a stale pre-prune view. The restore below overwrites the whole
+    // `backups` table with an older snapshot's own version of it; without
+    // this, any backup not part of that older snapshot (including the
+    // restore target itself and the safety backup just taken) would vanish
+    // from `list_backups` even though its file remains untouched on disk
+    // (production-safety review, Finding 4). This only re-reads rows that
+    // already validly existed a moment ago, so it can't register anything
+    // unverified as a backup.
+    let pre_restore_backups = snapshot_all_backup_rows(&state)?;
+
+    // 3. Restore the backup file's pages into the live, already-open
     // connection via SQLite's backup API (see module docs for why not a
-    // plain file swap).
-    let restore_result: Result<(), ApiError> = (|| {
+    // plain file swap), then immediately re-apply migrations and run the
+    // post-restore integrity check — all three under one continuous lock
+    // hold. Releasing and reacquiring the lock between these steps would
+    // open a window where a concurrent request could execute against a
+    // database that was just restored but not yet brought up to the
+    // running binary's expected schema (production-safety review,
+    // Finding 5). Restore is a rare, explicit, owner-only action, so
+    // holding the lock slightly longer here is an accepted trade-off, not
+    // a change to any other endpoint's concurrency behavior.
+    let restore_outcome: Result<String, ApiError> = (|| {
         let backup_conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| ApiError::Internal(format!("failed to open backup for restore: {e}")))?;
         let mut live = state.db.lock().expect("db mutex poisoned");
+
         let backup = Backup::new(&backup_conn, &mut live)
             .map_err(|e| ApiError::Internal(format!("restore init failed: {e}")))?;
         backup
             .run_to_completion(100, Duration::from_millis(50), None)
             .map_err(|e| ApiError::Internal(format!("restore failed: {e}")))?;
-        Ok(())
+        // Explicitly finalize and drop the `Backup` handle (which holds a
+        // mutable borrow of `live`) now that the copy is complete, so `live`
+        // can be used directly below for migrations and the integrity check
+        // without releasing its mutex guard in between.
+        drop(backup);
+
+        // 4. A restored backup from an older schema version now needs the
+        // binary's newer migrations re-applied; this is a no-op when the
+        // versions already match (see db::run_migrations's idempotency
+        // tests). Still holding `live`'s lock, so no other request can
+        // observe the gap between "restored" and "migrated".
+        crate::db::run_migrations(&live)?;
+
+        // 5. Post-restore integrity check on the now-live database, per
+        // spec §10 ("run integrity checks ... after restore").
+        let post_integrity: String = live.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        Ok(post_integrity)
     })();
 
-    if let Err(e) = restore_result {
-        return Err(ApiError::Internal(format!(
-            "restore failed ({e:?}); the live database may be inconsistent. A safety backup taken \
-             immediately before this attempt is available (backup_id: {}); restore from it to recover.",
-            safety_backup.backup_id
-        )));
-    }
-
-    // 4. A restored backup from an older schema version now needs the
-    // binary's newer migrations re-applied; this is a no-op when the
-    // versions already match (see db::run_migrations's idempotency tests).
-    {
-        let live = state.db.lock().expect("db mutex poisoned");
-        crate::db::run_migrations(&live)?;
-    }
-
-    // 5. Post-restore integrity check on the now-live database, per spec
-    // §10 ("run integrity checks ... after restore").
-    let post_integrity: String = {
-        let live = state.db.lock().expect("db mutex poisoned");
-        live.query_row("PRAGMA integrity_check", [], |r| r.get(0))?
+    let post_integrity = match restore_outcome {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::error!(
+                error = ?e,
+                restored_backup_id = %id,
+                safety_backup_id = %safety_backup.backup_id,
+                "restore-copy or re-migration failed"
+            );
+            return Err(ApiError::RestoreFailed {
+                client_message:
+                    "The restore operation did not complete. Your pre-restore data was \
+                    not lost — a safety backup was taken immediately before this attempt."
+                        .to_string(),
+                safety_backup_id: safety_backup.backup_id,
+            });
+        }
     };
+
     if post_integrity != "ok" {
-        return Err(ApiError::Internal(format!(
-            "restore completed but post-restore integrity check reported '{post_integrity}'; \
-             restore from the safety backup (backup_id: {}) immediately",
-            safety_backup.backup_id
-        )));
+        tracing::error!(
+            post_integrity = %post_integrity,
+            restored_backup_id = %id,
+            safety_backup_id = %safety_backup.backup_id,
+            "post-restore integrity check failed"
+        );
+        return Err(ApiError::RestoreFailed {
+            client_message: "Restore completed but the database failed a post-restore integrity \
+                check. Restore the safety backup listed here immediately."
+                .to_string(),
+            safety_backup_id: safety_backup.backup_id,
+        });
     }
 
-    // 6. The database we just restored is a full snapshot, including its own
-    // `backups` table as it looked at the moment that snapshot was taken —
-    // which predates both the row for the backup just restored-from (if it
-    // was the very first backup ever taken: its own row is inserted *after*
-    // its file is written) and the safety backup taken in step 2 (which by
-    // definition did not exist yet at snapshot time either). Without this,
-    // the safety backup — the one thing meant to let the owner undo this
-    // restore — would be invisible to `list_backups` even though its file
-    // is sitting right there on disk. Re-assert both rows; `OR IGNORE`
-    // because the snapshot may already contain one or both if it was taken
-    // later than their creation.
+    // 6. Re-assert every backup row captured just before the destructive
+    // restore (see the comment above `pre_restore_backups`). `OR IGNORE`
+    // because the restored snapshot may already contain some of them if it
+    // was taken later than their creation.
     {
         let conn = state.db.lock().expect("db mutex poisoned");
-        for row in [&restored_row, &safety_backup] {
+        for row in &pre_restore_backups {
             conn.execute(
                 "INSERT OR IGNORE INTO backups (backup_id, app_version, schema_version, path, checksum_sha256, created_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -421,9 +518,41 @@ async fn restore_backup_handler(
         }
     }
 
+    // A restore can replace the `businesses`/`users`/`sessions` tables
+    // wholesale (e.g. restoring a backup taken before `/api/setup` ever
+    // ran). The currently authenticated owner's `business_id`/`user_id`
+    // were captured by the `AuthUser` extractor *before* this handler ran,
+    // against the pre-restore tables — they may no longer exist. Check this
+    // explicitly so the response can tell the caller plainly, rather than
+    // leaving them to discover it only when their next request 401s.
+    let current_session_still_valid: bool = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        let business_exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM businesses WHERE business_id = ?1)",
+                rusqlite::params![user.business_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let user_exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE user_id = ?1)",
+                rusqlite::params![user.user_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        business_exists != 0 && user_exists != 0
+    };
+
+    // The restore itself has already fully succeeded by this point. A
+    // restored database whose business/user rows predate the current
+    // session can make this specific, best-effort audit write fail its
+    // foreign-key check — that must never be reported back as "the restore
+    // failed"; it's purely a bookkeeping gap on an otherwise-successful
+    // operation (production-safety review, Finding 3).
     {
         let conn = state.db.lock().expect("db mutex poisoned");
-        crate::audit::record(
+        if let Err(e) = crate::audit::record(
             &conn,
             &user.business_id,
             Some(&user.user_id),
@@ -435,12 +564,19 @@ async fn restore_backup_handler(
                 "safety_backup_id": safety_backup.backup_id,
             })
             .to_string(),
-        )?;
+        ) {
+            tracing::warn!(
+                error = ?e,
+                restored_backup_id = %id,
+                "post-restore audit entry could not be written (restore itself still succeeded)"
+            );
+        }
     }
 
     Ok(Json(serde_json::json!({
         "status": "restored",
         "restored_backup_id": id,
         "safety_backup_id": safety_backup.backup_id,
+        "current_session_still_valid": current_session_still_valid,
     })))
 }

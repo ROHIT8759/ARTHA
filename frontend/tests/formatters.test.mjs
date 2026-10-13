@@ -8,6 +8,8 @@ import {
   calculateLineTaxPaise,
   formatGstRate,
   formatBytes,
+  formatRestoreErrorMessage,
+  ApiError,
 } from "../lib/api.ts";
 
 describe("formatPaise - Indian Currency Formatter", () => {
@@ -263,6 +265,38 @@ describe("formatBytes - Backup File Size Formatter", () => {
 
   test("never exceeds the largest defined unit (GB)", () => {
     assert.equal(formatBytes(1024 * 1024 * 1024 * 1024), "1024.0 GB");
+  });
+});
+
+describe("formatRestoreErrorMessage - Restore Failure Recovery Guidance", () => {
+  test("appends safety-backup recovery guidance when present in error details", () => {
+    const err = new ApiError(
+      500,
+      "Restore completed but the database failed a post-restore integrity check.",
+      { error: "restore_failed", safety_backup_id: "abc123" }
+    );
+    assert.equal(
+      formatRestoreErrorMessage(err),
+      "Restore completed but the database failed a post-restore integrity check. A safety backup of your pre-restore data is available (id: abc123) — restore that to recover."
+    );
+  });
+
+  test("falls back to the plain message when no safety backup id is present", () => {
+    const err = new ApiError(404, "Backup not found", { error: "404", message: "Backup not found" });
+    assert.equal(formatRestoreErrorMessage(err), "Backup not found");
+  });
+
+  test("falls back to the plain message when details are entirely absent", () => {
+    const err = new ApiError(400, "Restore requires explicit confirmation (confirm: true)");
+    assert.equal(formatRestoreErrorMessage(err), "Restore requires explicit confirmation (confirm: true)");
+  });
+
+  test("handles a plain Error without ApiError details", () => {
+    assert.equal(formatRestoreErrorMessage(new Error("network down")), "network down");
+  });
+
+  test("handles a non-Error thrown value", () => {
+    assert.equal(formatRestoreErrorMessage("weird"), "Failed to restore backup");
   });
 });
 
