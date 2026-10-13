@@ -1,8 +1,9 @@
 use axum::extract::{Multipart, Path, Query, State};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::Path as StdPath;
 use tokio::fs;
 
 use crate::auth::AuthUser;
@@ -19,7 +20,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/purchases/:id/approve", post(approve_purchase))
         .route("/api/purchases/:id/cancel", post(cancel_purchase))
-        .route("/api/purchases/:id/image", post(upload_bill_image))
+        .route(
+            "/api/purchases/:id/image",
+            get(get_bill_image).post(upload_bill_image),
+        )
         .route("/api/purchases/:id/ocr", post(process_ocr))
 }
 
@@ -50,6 +54,7 @@ pub struct PurchaseView {
     pub created_by: String,
     pub created_at: String,
     pub items: Vec<PurchaseItemView>,
+    pub image_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +123,7 @@ async fn list_purchases(
             created_by: r.get(9)?,
             created_at: r.get(10)?,
             items: vec![],
+            image_id: None,
         })
     })?;
 
@@ -136,6 +142,14 @@ async fn get_purchase(
 ) -> Result<Json<PurchaseView>, ApiError> {
     let conn = state.db.lock().expect("db mutex poisoned");
 
+    let image_id: Option<String> = conn
+        .query_row(
+            "SELECT image_id FROM bill_images WHERE purchase_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .ok();
+
     let mut view = conn.query_row(
         "SELECT purchase_id, supplier_id, invoice_no, invoice_date, status, source, subtotal_paise, tax_total_paise, total_paise, created_by, created_at FROM purchases WHERE business_id = ?1 AND purchase_id = ?2",
         rusqlite::params![user.business_id, id],
@@ -153,6 +167,7 @@ async fn get_purchase(
                 created_by: r.get(9)?,
                 created_at: r.get(10)?,
                 items: vec![],
+                image_id,
             })
         }
     ).map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
@@ -210,6 +225,7 @@ async fn create_purchase(
         created_by: user.user_id,
         created_at: now,
         items: vec![],
+        image_id: None,
     }))
 }
 
@@ -398,6 +414,34 @@ async fn cancel_purchase(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
+const MAX_BILL_IMAGE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+fn validate_raster_image(bytes: &[u8]) -> Result<(&'static str, &'static str), ApiError> {
+    if bytes.is_empty() {
+        return Err(ApiError::BadRequest("Uploaded image is empty".into()));
+    }
+    if bytes.len() > MAX_BILL_IMAGE_BYTES {
+        return Err(ApiError::BadRequest("File exceeds 10 MiB limit".into()));
+    }
+
+    const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() >= 8 && bytes[0..8] == PNG_SIG {
+        return Ok(("image/png", "png"));
+    }
+
+    if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
+        return Ok(("image/jpeg", "jpg"));
+    }
+
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Ok(("image/webp", "webp"));
+    }
+
+    Err(ApiError::BadRequest(
+        "Unsupported image format. Only PNG, JPEG, and WebP raster images are allowed".into(),
+    ))
+}
+
 async fn upload_bill_image(
     State(state): State<AppState>,
     user: AuthUser,
@@ -424,12 +468,6 @@ async fn upload_bill_image(
     let mut image_bytes = None;
     while let Some(field) = multipart.next_field().await.unwrap_or(None) {
         if field.name() == Some("file") {
-            // validate content type
-            if let Some(ct) = field.content_type() {
-                if !ct.starts_with("image/") {
-                    return Err(ApiError::BadRequest("Only images are allowed".into()));
-                }
-            }
             image_bytes = Some(
                 field
                     .bytes()
@@ -440,21 +478,19 @@ async fn upload_bill_image(
     }
 
     let bytes = image_bytes.ok_or_else(|| ApiError::BadRequest("No file provided".into()))?;
-    if bytes.len() > 10 * 1024 * 1024 {
-        // 10MB limit
-        return Err(ApiError::BadRequest("File too large".into()));
-    }
-
+    let (mime, ext) = validate_raster_image(&bytes)?;
     let sha256_hex = hex::encode(sha2::Sha256::digest(&bytes));
 
-    // Store in a safe local path (prevent traversal)
-    let upload_dir = PathBuf::from("uploads");
-    if !upload_dir.exists() {
-        fs::create_dir_all(&upload_dir).await.unwrap();
+    if !state.upload_dir.exists() {
+        fs::create_dir_all(&state.upload_dir)
+            .await
+            .map_err(|e| ApiError::Internal(format!("failed to create upload dir: {e}")))?;
     }
 
-    let file_path = upload_dir.join(format!("{}.jpg", sha256_hex));
-    fs::write(&file_path, bytes).await.unwrap();
+    let file_path = state.upload_dir.join(format!("{sha256_hex}.{ext}"));
+    fs::write(&file_path, &bytes)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to save upload: {e}")))?;
 
     let image_id = new_id();
     let now = now_iso();
@@ -462,10 +498,45 @@ async fn upload_bill_image(
     let conn = state.db.lock().expect("db mutex poisoned");
     conn.execute(
         "INSERT INTO bill_images (image_id, purchase_id, path, sha256_hex, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![image_id, id, file_path.to_str().unwrap(), sha256_hex, now]
+        rusqlite::params![image_id, id, file_path.to_str().unwrap(), sha256_hex, now],
     )?;
 
-    Ok(Json(serde_json::json!({ "image_id": image_id })))
+    Ok(Json(serde_json::json!({
+        "image_id": image_id,
+        "sha256": sha256_hex,
+        "size_bytes": bytes.len(),
+        "mime": mime,
+    })))
+}
+
+async fn get_bill_image(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let path: String = {
+        let conn = state.db.lock().expect("db mutex poisoned");
+        conn.query_row(
+            "SELECT b.path FROM bill_images b JOIN purchases p ON b.purchase_id = p.purchase_id WHERE p.purchase_id = ?1 AND p.business_id = ?2 ORDER BY b.created_at DESC LIMIT 1",
+            rusqlite::params![id, user.business_id],
+            |r| r.get(0),
+        )
+        .map_err(|_| ApiError::NotFound("Bill image not found".into()))?
+    };
+
+    let bytes = fs::read(&path)
+        .await
+        .map_err(|_| ApiError::NotFound("Bill image file not found on disk".into()))?;
+
+    let mime = if path.ends_with(".png") {
+        "image/png"
+    } else if path.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    };
+
+    Ok(([(axum::http::header::CONTENT_TYPE, mime)], bytes).into_response())
 }
 
 use sha2::Digest;
@@ -481,8 +552,8 @@ async fn process_ocr(
     Path(id): Path<String>,
     Json(req): Json<OcrRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // 1. Validate
-    {
+    // 1. Validate purchase is draft and belongs to this business
+    let image_path: String = {
         let conn = state.db.lock().expect("db mutex poisoned");
         let status: String = conn
             .query_row(
@@ -496,48 +567,32 @@ async fn process_ocr(
             return Err(ApiError::Forbidden("Cannot run OCR on non-draft".into()));
         }
 
-        let image_exists: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM bill_images WHERE image_id = ?1 AND purchase_id = ?2",
+        conn.query_row(
+            "SELECT path FROM bill_images WHERE image_id = ?1 AND purchase_id = ?2",
             rusqlite::params![req.image_id, id],
             |r| r.get(0),
-        )?;
+        )
+        .map_err(|_| ApiError::NotFound("Image not found on this purchase".into()))?
+    };
 
-        if image_exists == 0 {
-            return Err(ApiError::NotFound(
-                "Image not found on this purchase".into(),
-            ));
-        }
-    }
-
-    // 2. Mock PaddleOCR Execution Boundary
-    // In a real implementation this would spawn a local process: `paddleocr --image_dir uploads/img.jpg`
-    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+    // 2. Run OCR & Deterministic Bill Parser
+    let (payload, parsed) = crate::ocr::execute_ocr(StdPath::new(&image_path)).await?;
 
     let ocr_id = new_id();
+    let text_json = serde_json::to_string(&payload.tokens).unwrap_or_else(|_| "[]".to_string());
+    let boxes_json = "[]".to_string();
+    let now = now_iso();
 
     let conn = state.db.lock().expect("db mutex poisoned");
     conn.execute(
-        "INSERT INTO ocr_results (ocr_id, image_id, text_json, boxes_json, confidence, engine_version, created_at) 
-         VALUES (?1, ?2, '[]', '[]', 0.95, 'mock_paddle_ocr_v1', ?3)",
-        rusqlite::params![ocr_id, req.image_id, now_iso()]
+        "INSERT INTO ocr_results (ocr_id, image_id, text_json, boxes_json, confidence, engine_version, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![ocr_id, req.image_id, text_json, boxes_json, payload.confidence, payload.engine_version, now],
     )?;
 
-    // Return mocked extracted parsed items for the frontend to apply to the draft
-    // The requirement says: "Parser converts OCR results into purchase draft fields... Human review/edit works"
     Ok(Json(serde_json::json!({
         "status": "completed",
         "ocr_id": ocr_id,
-        "parsed": {
-            "invoice_no": "INV-OCR-001",
-            "invoice_date": "2026-10-06",
-            "items": [
-                {
-                    "product_name_snapshot": "ABC Product 1L",
-                    "quantity_milli": 5000,
-                    "price_paise": 15000,
-                    "gst_rate_bps": 1800
-                }
-            ]
-        }
+        "parsed": parsed,
     })))
 }

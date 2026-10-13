@@ -27,6 +27,7 @@ async fn main() {
         db: Arc::new(Mutex::new(conn)),
         backup_dir: config.backup_dir.clone(),
         backup_retention: config.backup_retention,
+        upload_dir: config.upload_dir.clone(),
     };
     spawn_backup_scheduler(state.clone(), config.backup_interval_secs);
     let app = build_app(state);

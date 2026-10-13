@@ -35,6 +35,7 @@ pub struct Config {
     pub backup_dir: PathBuf,
     pub backup_retention: usize,
     pub backup_interval_secs: u64,
+    pub upload_dir: PathBuf,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -152,6 +153,15 @@ impl Config {
             },
         };
 
+        let upload_dir = get("ARTHA_UPLOAD_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                db_path
+                    .parent()
+                    .map(|p| p.join("uploads"))
+                    .unwrap_or_else(|| PathBuf::from("uploads"))
+            });
+
         // Resolve eagerly so a typo'd host fails fast at startup rather than
         // on the first incoming connection attempt.
         let _ = format!("{host}:{port}")
@@ -167,6 +177,7 @@ impl Config {
             backup_dir,
             backup_retention,
             backup_interval_secs,
+            upload_dir,
         })
     }
 
@@ -201,6 +212,7 @@ mod tests {
         assert_eq!(cfg.backup_dir, PathBuf::from("data/backups"));
         assert_eq!(cfg.backup_retention, 24);
         assert_eq!(cfg.backup_interval_secs, 3600);
+        assert_eq!(cfg.upload_dir, PathBuf::from("data/uploads"));
     }
 
     #[test]
@@ -214,6 +226,7 @@ mod tests {
             ("ARTHA_BACKUP_DIR", "custom/backups"),
             ("ARTHA_BACKUP_RETENTION", "10"),
             ("ARTHA_BACKUP_INTERVAL_SECS", "1800"),
+            ("ARTHA_UPLOAD_DIR", "custom/uploads"),
         ]))
         .unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
@@ -224,6 +237,7 @@ mod tests {
         assert_eq!(cfg.backup_dir, PathBuf::from("custom/backups"));
         assert_eq!(cfg.backup_retention, 10);
         assert_eq!(cfg.backup_interval_secs, 1800);
+        assert_eq!(cfg.upload_dir, PathBuf::from("custom/uploads"));
     }
 
     #[test]
@@ -231,6 +245,13 @@ mod tests {
         let cfg =
             Config::from_lookup(lookup(&[("ARTHA_DB_PATH", "some/nested/artha.db")])).unwrap();
         assert_eq!(cfg.backup_dir, PathBuf::from("some/nested/backups"));
+    }
+
+    #[test]
+    fn upload_dir_defaults_next_to_db_path_when_not_overridden() {
+        let cfg =
+            Config::from_lookup(lookup(&[("ARTHA_DB_PATH", "some/nested/artha.db")])).unwrap();
+        assert_eq!(cfg.upload_dir, PathBuf::from("some/nested/uploads"));
     }
 
     #[test]

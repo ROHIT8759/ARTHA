@@ -258,3 +258,326 @@ async fn test_purchase_workflow() {
         .unwrap();
     assert_eq!(body_json(resp).await["current_stock_milli"], 10_000); // unaffected
 }
+
+fn multipart_image_request(
+    uri: &str,
+    token: &str,
+    file_name: &str,
+    file_bytes: Vec<u8>,
+    content_type: &str,
+) -> Request<Body> {
+    let boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+    let mut body_bytes = Vec::new();
+    body_bytes.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body_bytes.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: {content_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body_bytes.extend_from_slice(&file_bytes);
+    body_bytes.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body_bytes))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_bill_image_upload_magic_bytes_and_retrieval() {
+    let app = test_app();
+    let token = setup_owner(&app).await;
+
+    // 1. Create a draft purchase
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/purchases",
+            Some(&token),
+            json!({ "source": "ocr" }),
+        ))
+        .await
+        .unwrap();
+    let purchase_id = body_json(resp).await["purchase_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Upload invalid spoofed file (e.g. text/html pretending to be image) -> 400 Bad Request
+    let evil_payload = b"<html><script>alert(1)</script></html>".to_vec();
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token,
+            "bill.png",
+            evil_payload,
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Upload valid PNG image with genuine raster magic bytes
+    let valid_png: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52,
+    ];
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token,
+            "invoice.png",
+            valid_png.clone(),
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let upload_json = body_json(resp).await;
+    assert_eq!(upload_json["mime"], "image/png");
+    let image_id = upload_json["image_id"].as_str().unwrap().to_string();
+
+    // 4. Retrieve image via GET -> returns 200, Content-Type image/png and identical bytes
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/purchases/{purchase_id}/image"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+    let retrieved_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(retrieved_bytes.as_ref(), valid_png.as_slice());
+
+    // 5. Get purchase view includes image_id
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/purchases/{purchase_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["image_id"], image_id);
+}
+
+#[tokio::test]
+async fn test_ocr_pipeline_and_human_review_workflow() {
+    let app = test_app();
+    let token = setup_owner(&app).await;
+
+    // Create a product to match against later
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/products",
+            Some(&token),
+            json!({ "name": "Basmati Rice 5kg", "qr_code": "QR-RICE-5", "price_paise": 40000, "cost_paise": 35000, "gst_rate_bps": 500 }),
+        ))
+        .await
+        .unwrap();
+    let rice_id = body_json(resp).await["product_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 1. Create draft purchase
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/purchases",
+            Some(&token),
+            json!({ "source": "ocr" }),
+        ))
+        .await
+        .unwrap();
+    let purchase_id = body_json(resp).await["purchase_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Upload valid JPEG bill image
+    let valid_jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46];
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token,
+            "bill.jpg",
+            valid_jpeg,
+            "image/jpeg",
+        ))
+        .await
+        .unwrap();
+    let image_id = body_json(resp).await["image_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 3. Trigger OCR process
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{purchase_id}/ocr"),
+            Some(&token),
+            json!({ "image_id": image_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ocr_res = body_json(resp).await;
+    assert_eq!(ocr_res["status"], "completed");
+    assert_eq!(ocr_res["parsed"]["invoice_no"], "INV-2026-089");
+    assert_eq!(ocr_res["parsed"]["invoice_date"], "2026-10-12");
+
+    let parsed_items = ocr_res["parsed"]["items"].as_array().unwrap();
+    assert!(!parsed_items.is_empty());
+
+    // Invariant check: OCR does NOT mutate purchase total_paise or inventory!
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/purchases/{purchase_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let purchase_view = body_json(resp).await;
+    assert_eq!(purchase_view["total_paise"], 0);
+    assert_eq!(purchase_view["status"], "draft");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/inventory/{rice_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["current_stock_milli"], 0);
+
+    // 4. Staff applies extracted OCR data to draft with unresolved product
+    let first_item = &parsed_items[0];
+    let draft_items = vec![json!({
+        "product_id": null, // Unmatched initially
+        "product_name_snapshot": first_item["product_name_snapshot"].as_str().unwrap(),
+        "quantity_milli": first_item["quantity_milli"].as_i64().unwrap(),
+        "price_paise": first_item["price_paise"].as_i64().unwrap(),
+        "gst_rate_bps": first_item["gst_rate_bps"].as_i64().unwrap(),
+    })];
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/api/purchases/{purchase_id}"),
+            Some(&token),
+            json!({
+                "invoice_no": ocr_res["parsed"]["invoice_no"].as_str().unwrap(),
+                "invoice_date": ocr_res["parsed"]["invoice_date"].as_str().unwrap(),
+                "items": draft_items,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Invariant check: approve fails because item is unmatched
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{purchase_id}/approve"),
+            Some(&token),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 5. Staff matches the item to our catalog product and approves
+    let resolved_items = vec![json!({
+        "product_id": rice_id, // Matched!
+        "product_name_snapshot": "Basmati Rice 5kg",
+        "quantity_milli": 5000,
+        "price_paise": 35000,
+        "gst_rate_bps": 500,
+    })];
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/api/purchases/{purchase_id}"),
+            Some(&token),
+            json!({
+                "invoice_no": "INV-2026-089",
+                "items": resolved_items,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let updated_view = body_json(resp).await;
+    // 5 units @ 35000 paise = 175000 subtotal + 5% tax (8750) = 183750
+    assert_eq!(updated_view["total_paise"], 183750);
+
+    // Approve purchase
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{purchase_id}/approve"),
+            Some(&token),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Invariant check: stock incremented accurately only on approval!
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/inventory/{rice_id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["current_stock_milli"], 5000);
+}
