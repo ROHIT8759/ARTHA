@@ -614,7 +614,16 @@ mod tests {
             (Some(script), path_str)
         };
         #[cfg(not(windows))]
-        let (script_path, cmd): (Option<std::path::PathBuf>, String) = (None, "sleep".to_string());
+        let (script_path, cmd) = {
+            use std::os::unix::fs::PermissionsExt;
+            let script = temp_dir.join(format!("test_hang_{}.sh", std::process::id()));
+            std::fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+            let path_str = script.to_string_lossy().to_string();
+            (Some(script), path_str)
+        };
 
         let result = execute_ocr(
             &image_path,

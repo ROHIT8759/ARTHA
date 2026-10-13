@@ -908,7 +908,17 @@ async fn test_ocr_failure_and_timeout_preserve_draft_and_inventory() {
         (Some(script), path_str)
     };
     #[cfg(not(windows))]
-    let (script_path, hang_cmd): (Option<std::path::PathBuf>, String) = (None, "sleep".to_string());
+    let (script_path, hang_cmd) = {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = std::env::temp_dir();
+        let script = temp_dir.join(format!("test_hang_ocr_route_{}.sh", std::process::id()));
+        std::fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        let path_str = script.to_string_lossy().to_string();
+        (Some(script), path_str)
+    };
 
     let conn2 = db::open_in_memory();
     let mut state2 = AppState::for_tests(conn2);
