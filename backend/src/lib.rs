@@ -11,6 +11,7 @@ pub mod error;
 pub mod ids;
 pub mod logging;
 pub mod models;
+pub mod ocr;
 pub mod routes;
 
 use std::path::PathBuf;
@@ -30,6 +31,10 @@ pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub backup_dir: PathBuf,
     pub backup_retention: usize,
+    pub upload_dir: PathBuf,
+    pub environment: crate::config::Environment,
+    pub paddle_ocr_cmd: Option<String>,
+    pub ocr_timeout_secs: u64,
 }
 
 impl AppState {
@@ -46,6 +51,11 @@ impl AppState {
             backup_dir: std::env::temp_dir()
                 .join(format!("artha_test_backups_{}", std::process::id())),
             backup_retention: 24,
+            upload_dir: std::env::temp_dir()
+                .join(format!("artha_test_uploads_{}", std::process::id())),
+            environment: crate::config::Environment::Development,
+            paddle_ocr_cmd: None,
+            ocr_timeout_secs: 30,
         }
     }
 }

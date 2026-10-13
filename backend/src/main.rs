@@ -27,12 +27,16 @@ async fn main() {
         db: Arc::new(Mutex::new(conn)),
         backup_dir: config.backup_dir.clone(),
         backup_retention: config.backup_retention,
+        upload_dir: config.upload_dir.clone(),
+        environment: config.environment,
+        paddle_ocr_cmd: config.paddle_ocr_cmd.clone(),
+        ocr_timeout_secs: config.ocr_timeout_secs,
     };
     spawn_backup_scheduler(state.clone(), config.backup_interval_secs);
     let app = build_app(state);
 
     let addr = config.socket_addr();
-    tracing::info!(db = %config.db_path.display(), %addr, env = ?config.environment, backup_dir = %config.backup_dir.display(), backup_interval_secs = config.backup_interval_secs, "starting artha-server");
+    tracing::info!(db = %config.db_path.display(), %addr, env = ?config.environment, backup_dir = %config.backup_dir.display(), backup_interval_secs = config.backup_interval_secs, ocr_cmd = ?config.paddle_ocr_cmd, ocr_timeout_secs = config.ocr_timeout_secs, "starting artha-server");
     println!("ARTHA server listening on http://{addr}");
     println!("Staff on this Wi-Fi/LAN can connect using this PC's local IP instead of {}, e.g. http://<this-pc-ip>:{}", config.host, addr.port());
 

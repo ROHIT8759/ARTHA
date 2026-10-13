@@ -182,7 +182,7 @@ export const api = {
     return request<Array<{ purchase_id: string; supplier_id?: string; invoice_no?: string; invoice_date?: string; status: string; source: string; subtotal_paise: number; tax_total_paise: number; total_paise: number; created_by: string; created_at: string }>>(qs ? `/api/purchases?${qs}` : "/api/purchases");
   },
   getPurchase: (purchaseId: string) => request<{
-    purchase_id: string; supplier_id?: string; invoice_no?: string; invoice_date?: string; status: string; source: string; subtotal_paise: number; tax_total_paise: number; total_paise: number; created_by: string; created_at: string;
+    purchase_id: string; supplier_id?: string; invoice_no?: string; invoice_date?: string; status: string; source: string; subtotal_paise: number; tax_total_paise: number; total_paise: number; created_by: string; created_at: string; image_id?: string;
     items: Array<{
       purchase_item_id: string;
       product_id?: string;
@@ -203,17 +203,36 @@ export const api = {
   uploadBillImage: async (purchaseId: string, file: File) => {
     const formData = new FormData();
     formData.append("file", file);
-    const token = localStorage.getItem("token");
-    const res = await fetch(`/api/purchases/${purchaseId}/image`, {
+    const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
+    const res = await fetch(`${API_BASE}/api/purchases/${purchaseId}/image`, {
       method: "POST",
-      headers: { "Authorization": `Bearer ${token}` },
-      body: formData
+      headers: token ? { "Authorization": `Bearer ${token}` } : {},
+      body: formData,
     });
-    if (!res.ok) throw new Error("Upload failed");
-    return res.json() as Promise<{ image_id: string }>;
+    if (!res.ok) {
+      let msg = "Upload failed";
+      try {
+        const errJson = await res.json();
+        if (errJson?.message) msg = errJson.message;
+      } catch {
+        // use fallback message
+      }
+      throw new Error(msg);
+    }
+    return res.json() as Promise<{ image_id: string; sha256: string; mime: string }>;
   },
   
-  processOcr: (purchaseId: string, imageId: string) => request<{ parsed?: { invoice_no?: string; items?: Array<Record<string, unknown>> }, status: string }>(`/api/purchases/${purchaseId}/ocr`, { method: "POST", body: JSON.stringify({ image_id: imageId }) }),
+  getBillImageUrl: (purchaseId: string) => `${API_BASE}/api/purchases/${purchaseId}/image`,
+  
+  processOcr: (purchaseId: string, imageId: string) =>
+    request<{
+      status: string;
+      ocr_id: string;
+      parsed: ParsedOcrBill;
+    }>(`/api/purchases/${purchaseId}/ocr`, {
+      method: "POST",
+      body: JSON.stringify({ image_id: imageId }),
+    }),
 
   // --- SALES & BILLING ---
   listSales: (query?: { status?: string; search?: string; limit?: number }) => {
@@ -308,6 +327,25 @@ export const api = {
       current_session_still_valid: boolean;
     }>(`/api/backups/${backupId}/restore`, { method: "POST", body: JSON.stringify({ confirm }) }),
 };
+
+export interface ParsedOcrItem {
+  product_name_snapshot: string;
+  quantity_milli: number;
+  price_paise: number;
+  gst_rate_bps: number;
+  confidence: number;
+}
+
+export interface ParsedOcrBill {
+  invoice_no?: string;
+  invoice_no_confidence?: number;
+  invoice_date?: string;
+  invoice_date_confidence?: number;
+  supplier_name?: string;
+  items: ParsedOcrItem[];
+  stated_total_paise?: number;
+  average_confidence?: number;
+}
 
 export interface BackupView {
   backup_id: string;

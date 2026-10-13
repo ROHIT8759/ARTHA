@@ -14,6 +14,7 @@ pub enum ApiError {
     Forbidden(String),
     NotFound(String),
     Conflict(String),
+    PayloadTooLarge(String),
     Internal(String),
     /// A destructive operation (currently: backup restore) failed *after* a
     /// mandatory safety backup was already taken. Unlike `Internal`, this
@@ -37,6 +38,7 @@ impl ApiError {
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
+            ApiError::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             // Never actually reached: `into_response` intercepts this variant
             // before calling `status_and_message`. Kept so the match stays
