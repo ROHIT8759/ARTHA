@@ -312,50 +312,8 @@ pub fn parse_bill_tokens(tokens: &[OcrToken]) -> ParsedBill {
     }
 }
 
-/// Executes OCR processing on an image file.
-/// If `ARTHA_PADDLE_OCR_CMD` is set, executes the local external process.
-/// Otherwise, provides safe fixture fallback / graceful execution.
-pub async fn execute_ocr(image_path: &Path) -> Result<(OcrResultPayload, ParsedBill), ApiError> {
-    if !image_path.exists() {
-        return Err(ApiError::NotFound("Image file not found on disk".into()));
-    }
-
-    // Check if external OCR runner is configured in environment
-    if let Ok(cmd) = std::env::var("ARTHA_PADDLE_OCR_CMD") {
-        let path_str = image_path.to_string_lossy().to_string();
-        let cmd_clone = cmd.clone();
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new(&cmd_clone)
-                .arg(&path_str)
-                .output()
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("OCR worker task failed: {e}")))?
-        .map_err(|e| ApiError::Internal(format!("Failed to execute OCR process '{cmd}': {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ApiError::Internal(format!(
-                "OCR engine returned error: {stderr}"
-            )));
-        }
-
-        let raw_tokens: Vec<OcrToken> = serde_json::from_slice(&output.stdout).map_err(|e| {
-            ApiError::Internal(format!("Failed to parse OCR engine JSON output: {e}"))
-        })?;
-
-        let parsed = parse_bill_tokens(&raw_tokens);
-        let payload = OcrResultPayload {
-            engine_version: "paddleocr_cli_v1".to_string(),
-            confidence: parsed.average_confidence,
-            tokens: raw_tokens,
-        };
-        return Ok((payload, parsed));
-    }
-
-    // Default built-in OCR processor for development & tests:
-    // Returns realistic parsed invoice candidate tokens
-    let tokens = vec![
+pub fn fixture_tokens() -> Vec<OcrToken> {
+    vec![
         OcrToken {
             text: "SHREE GANESH ENTERPRISES".to_string(),
             confidence: 0.98,
@@ -401,11 +359,90 @@ pub async fn execute_ocr(image_path: &Path) -> Result<(OcrResultPayload, ParsedB
             confidence: 0.95,
             box_points: None,
         },
-    ];
+    ]
+}
 
+/// Executes OCR processing on an image file.
+///
+/// Priority & Subprocess Management:
+/// 1. If an external OCR command (`cmd_opt`) is provided, spawns that child process using
+///    Tokio's async process API with `kill_on_drop(true)` and bounds execution by `timeout_duration`.
+///    On timeout, the child process is terminated and reaped immediately.
+/// 2. If no command is configured:
+///    - In Production (`Environment::Production`): Fails with an actionable `ApiError::BadRequest`
+///      indicating that local OCR is not configured and advising manual entry. It NEVER returns
+///      dummy fixture data in production.
+///    - In Development / Tests (`Environment::Development`): Returns deterministic fixture
+///      tokens for testing and offline local development.
+pub async fn execute_ocr(
+    image_path: &Path,
+    cmd_opt: Option<&str>,
+    environment: crate::config::Environment,
+    timeout_duration: std::time::Duration,
+) -> Result<(OcrResultPayload, ParsedBill), ApiError> {
+    if !image_path.exists() {
+        return Err(ApiError::NotFound("Image file not found on disk".into()));
+    }
+
+    if let Some(cmd) = cmd_opt {
+        let path_str = image_path.to_string_lossy().to_string();
+        let child = tokio::process::Command::new(cmd)
+            .arg(&path_str)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                ApiError::BadRequest(format!(
+                    "Failed to execute configured OCR process '{cmd}': {e}"
+                ))
+            })?;
+
+        let output = match tokio::time::timeout(timeout_duration, child.wait_with_output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                return Err(ApiError::Internal(format!("OCR process I/O error: {e}")));
+            }
+            Err(_) => {
+                return Err(ApiError::BadRequest(format!(
+                    "OCR processing timed out after {} seconds",
+                    timeout_duration.as_secs()
+                )));
+            }
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::BadRequest(format!(
+                "OCR engine returned error: {stderr}"
+            )));
+        }
+
+        let raw_tokens: Vec<OcrToken> = serde_json::from_slice(&output.stdout).map_err(|e| {
+            ApiError::BadRequest(format!("Failed to parse OCR engine JSON output: {e}"))
+        })?;
+
+        let parsed = parse_bill_tokens(&raw_tokens);
+        let payload = OcrResultPayload {
+            engine_version: "paddleocr_cli_v1".to_string(),
+            confidence: parsed.average_confidence,
+            tokens: raw_tokens,
+        };
+        return Ok((payload, parsed));
+    }
+
+    // No OCR command configured:
+    if environment == crate::config::Environment::Production {
+        return Err(ApiError::BadRequest(
+            "Local OCR engine is not configured on this server (ARTHA_PADDLE_OCR_CMD is not set). Please configure an OCR command or enter bill details manually.".into(),
+        ));
+    }
+
+    // Default built-in OCR processor for development & tests:
+    let tokens = fixture_tokens();
     let parsed = parse_bill_tokens(&tokens);
     let payload = OcrResultPayload {
-        engine_version: "artha_ocr_v1".to_string(),
+        engine_version: "artha_ocr_dev_fixture_v1".to_string(),
         confidence: parsed.average_confidence,
         tokens,
     };
@@ -498,5 +535,108 @@ mod tests {
         assert_eq!(parsed.items[1].quantity_milli, 1000);
         assert_eq!(parsed.items[1].price_paise, 55000);
         assert_eq!(parsed.items[1].gst_rate_bps, 1200);
+    }
+
+    #[tokio::test]
+    async fn test_execute_ocr_production_without_cmd_fails_clearly() {
+        let temp_dir = std::env::temp_dir();
+        let image_path = temp_dir.join(format!("test_img_prod_{}.png", std::process::id()));
+        std::fs::write(&image_path, b"test-image-content").unwrap();
+
+        let result = execute_ocr(
+            &image_path,
+            None,
+            crate::config::Environment::Production,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        let _ = std::fs::remove_file(&image_path);
+
+        match result {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains("Local OCR engine is not configured on this server"),
+                    "Expected actionable error message, got: {msg}"
+                );
+            }
+            other => panic!("Expected ApiError::BadRequest, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_ocr_development_without_cmd_returns_fixtures() {
+        let temp_dir = std::env::temp_dir();
+        let image_path = temp_dir.join(format!("test_img_dev_{}.png", std::process::id()));
+        std::fs::write(&image_path, b"test-image-content").unwrap();
+
+        let result = execute_ocr(
+            &image_path,
+            None,
+            crate::config::Environment::Development,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        let _ = std::fs::remove_file(&image_path);
+
+        let (payload, parsed) = result.expect("Dev mode should succeed with fixtures");
+        assert_eq!(payload.engine_version, "artha_ocr_dev_fixture_v1");
+        assert_eq!(parsed.invoice_no, Some("INV-2026-089".to_string()));
+        assert_eq!(parsed.items.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_execute_ocr_missing_file_returns_not_found() {
+        let nonexistent = Path::new("nonexistent_artha_test_image.png");
+        let result = execute_ocr(
+            nonexistent,
+            None,
+            crate::config::Environment::Development,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_execute_ocr_timeout_terminates_and_returns_error() {
+        let temp_dir = std::env::temp_dir();
+        let image_path = temp_dir.join(format!("test_img_timeout_{}.png", std::process::id()));
+        std::fs::write(&image_path, b"test-image-content").unwrap();
+
+        #[cfg(windows)]
+        let (script_path, cmd) = {
+            let script = temp_dir.join(format!("test_hang_{}.cmd", std::process::id()));
+            std::fs::write(&script, "@ping -n 5 127.0.0.1 >nul\r\n").unwrap();
+            let path_str = script.to_string_lossy().to_string();
+            (Some(script), path_str)
+        };
+        #[cfg(not(windows))]
+        let (script_path, cmd): (Option<std::path::PathBuf>, String) = (None, "sleep".to_string());
+
+        let result = execute_ocr(
+            &image_path,
+            Some(&cmd),
+            crate::config::Environment::Development,
+            std::time::Duration::from_millis(150),
+        )
+        .await;
+
+        let _ = std::fs::remove_file(&image_path);
+        if let Some(script) = script_path {
+            let _ = std::fs::remove_file(script);
+        }
+
+        match result {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains("timed out"),
+                    "Expected timeout message, got: {msg}"
+                );
+            }
+            other => panic!("Expected timeout ApiError::BadRequest, got: {other:?}"),
+        }
     }
 }

@@ -581,3 +581,398 @@ async fn test_ocr_pipeline_and_human_review_workflow() {
         .unwrap();
     assert_eq!(body_json(resp).await["current_stock_milli"], 5000);
 }
+
+#[tokio::test]
+async fn test_route_specific_upload_body_limits() {
+    let app = test_app();
+    let token = setup_owner(&app).await;
+
+    // 1. Create a draft purchase
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/purchases",
+            Some(&token),
+            json!({ "source": "ocr" }),
+        ))
+        .await
+        .unwrap();
+    let purchase_id = body_json(resp).await["purchase_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Upload valid PNG image of ~2.5 MiB (exceeds Axum's default 2 MiB, but under 10 MiB limit)
+    let png_header: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut large_valid_png = Vec::with_capacity(2_500_000);
+    large_valid_png.extend_from_slice(&png_header);
+    large_valid_png.resize(2_500_000, 0x00);
+
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token,
+            "bill_2_5mb.png",
+            large_valid_png,
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "Valid 2.5 MiB image upload must succeed under the route's 10 MiB limit"
+    );
+
+    // 3. Upload oversized image of ~10.5 MiB (exceeds 10 MiB limit) -> 413 Payload Too Large
+    let mut oversized_png = Vec::with_capacity(10_500_000);
+    oversized_png.extend_from_slice(&png_header);
+    oversized_png.resize(10_500_000, 0x00);
+
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token,
+            "bill_10_5mb.png",
+            oversized_png,
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "Oversized 10.5 MiB image must be rejected with 413 Payload Too Large"
+    );
+
+    // 4. Send 2.5 MiB body to an unrelated route (POST /api/purchases) -> 413 Payload Too Large
+    // Confirms that the 10 MiB limit is strictly route-specific and unrelated routes retain the 2 MiB default
+    let big_padding = "x".repeat(2_500_000);
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/purchases",
+            Some(&token),
+            json!({ "invoice_no": big_padding }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "Unrelated route must retain Axum's default 2 MiB limit and reject 2.5 MiB payloads"
+    );
+}
+
+#[tokio::test]
+async fn test_ocr_production_mode_without_cmd_preserves_invariants() {
+    let conn = db::open_in_memory();
+    let mut state = AppState::for_tests(conn);
+    state.environment = artha_server::config::Environment::Production;
+    state.paddle_ocr_cmd = None;
+    let db_ref = state.db.clone();
+    let app = build_app(state);
+    let token = setup_owner(&app).await;
+
+    // Create a product
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/products",
+            Some(&token),
+            json!({ "name": "Cooking Oil 1L", "qr_code": "QR-OIL-1", "price_paise": 15000, "cost_paise": 12000, "gst_rate_bps": 500 }),
+        ))
+        .await
+        .unwrap();
+    let oil_id = body_json(resp).await["product_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Create draft purchase & upload bill image
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/purchases",
+            Some(&token),
+            json!({ "source": "ocr" }),
+        ))
+        .await
+        .unwrap();
+    let purchase_id = body_json(resp).await["purchase_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let valid_png: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52,
+    ];
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token,
+            "bill.png",
+            valid_png,
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    let image_id = body_json(resp).await["image_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Trigger OCR in production mode with no command configured -> must fail clearly
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{purchase_id}/ocr"),
+            Some(&token),
+            json!({ "image_id": image_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err_json = body_json(resp).await;
+    let msg = err_json["message"].as_str().unwrap();
+    assert!(
+        msg.contains("Local OCR engine is not configured on this server"),
+        "Must return actionable error, got: {msg}"
+    );
+
+    // Verify invariants: draft unchanged, no OCR results recorded, stock unchanged
+    {
+        let conn = db_ref.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM purchases WHERE purchase_id = ?1",
+                rusqlite::params![purchase_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "draft");
+
+        let ocr_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ocr_results WHERE image_id = ?1",
+                rusqlite::params![image_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ocr_count, 0, "No OCR results should be written on failure");
+
+        let stock: i64 = conn
+            .query_row(
+                "SELECT stock_qty_milli FROM products WHERE product_id = ?1",
+                rusqlite::params![oil_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stock, 0, "Stock must remain 0 on OCR failure");
+    }
+
+    // Verify core purchase workflow still functions: manual entry and approval
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/api/purchases/{purchase_id}"),
+            Some(&token),
+            json!({
+                "invoice_no": "MANUAL-INV-001",
+                "items": [{
+                    "product_id": oil_id,
+                    "product_name_snapshot": "Cooking Oil 1L",
+                    "quantity_milli": 10000,
+                    "price_paise": 12000,
+                    "gst_rate_bps": 500,
+                }],
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{purchase_id}/approve"),
+            Some(&token),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Stock successfully updated to 10000 milli (10 units)
+    let conn = db_ref.lock().unwrap();
+    let stock: i64 = conn
+        .query_row(
+            "SELECT stock_qty_milli FROM products WHERE product_id = ?1",
+            rusqlite::params![oil_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stock, 10000);
+}
+
+#[tokio::test]
+async fn test_ocr_failure_and_timeout_preserve_draft_and_inventory() {
+    let conn = db::open_in_memory();
+    let mut state = AppState::for_tests(conn);
+    // 1. Configured with a non-existent command
+    state.paddle_ocr_cmd = Some("nonexistent_ocr_command_binary_12345".to_string());
+    let db_ref = state.db.clone();
+    let app = build_app(state);
+    let token = setup_owner(&app).await;
+
+    // Create draft purchase & upload image
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/purchases",
+            Some(&token),
+            json!({ "source": "ocr" }),
+        ))
+        .await
+        .unwrap();
+    let purchase_id = body_json(resp).await["purchase_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let valid_png: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52,
+    ];
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token,
+            "bill.png",
+            valid_png,
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    let image_id = body_json(resp).await["image_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Trigger OCR with non-existent command -> 400 Bad Request
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{purchase_id}/ocr"),
+            Some(&token),
+            json!({ "image_id": image_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Verify purchase draft status is still "draft"
+    {
+        let conn = db_ref.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM purchases WHERE purchase_id = ?1",
+                rusqlite::params![purchase_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "draft");
+    }
+
+    // 2. Timeout test
+    let temp_dir = std::env::temp_dir();
+    #[cfg(windows)]
+    let (script_path, hang_cmd) = {
+        let script = temp_dir.join(format!("test_hang_ocr_route_{}.cmd", std::process::id()));
+        std::fs::write(&script, "@ping -n 5 127.0.0.1 >nul\r\n").unwrap();
+        let path_str = script.to_string_lossy().to_string();
+        (Some(script), path_str)
+    };
+    #[cfg(not(windows))]
+    let (script_path, hang_cmd): (Option<std::path::PathBuf>, String) = (None, "sleep".to_string());
+
+    let conn2 = db::open_in_memory();
+    let mut state2 = AppState::for_tests(conn2);
+    state2.paddle_ocr_cmd = Some(hang_cmd);
+    state2.ocr_timeout_secs = 1;
+    let app2 = build_app(state2);
+    let token2 = setup_owner(&app2).await;
+
+    let resp = app2
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/purchases",
+            Some(&token2),
+            json!({ "source": "ocr" }),
+        ))
+        .await
+        .unwrap();
+    let purchase_id2 = body_json(resp).await["purchase_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let valid_png2: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52,
+    ];
+    let resp = app2
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id2}/image"),
+            &token2,
+            "bill.png",
+            valid_png2,
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    let image_id2 = body_json(resp).await["image_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app2
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{purchase_id2}/ocr"),
+            Some(&token2),
+            json!({ "image_id": image_id2 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err_msg = body_json(resp).await["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        err_msg.contains("timed out"),
+        "Expected timeout error, got: {err_msg}"
+    );
+
+    if let Some(p) = script_path {
+        let _ = std::fs::remove_file(p);
+    }
+}

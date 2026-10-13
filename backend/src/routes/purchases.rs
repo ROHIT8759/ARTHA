@@ -1,4 +1,4 @@
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -11,6 +11,8 @@ use crate::error::ApiError;
 use crate::ids::{new_id, now_iso};
 use crate::AppState;
 
+pub const MAX_BILL_IMAGE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/purchases", get(list_purchases).post(create_purchase))
@@ -22,7 +24,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/purchases/:id/cancel", post(cancel_purchase))
         .route(
             "/api/purchases/:id/image",
-            get(get_bill_image).post(upload_bill_image),
+            get(get_bill_image)
+                .post(upload_bill_image)
+                .layer(DefaultBodyLimit::max(MAX_BILL_IMAGE_BYTES)),
         )
         .route("/api/purchases/:id/ocr", post(process_ocr))
 }
@@ -414,14 +418,14 @@ async fn cancel_purchase(
     Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
-const MAX_BILL_IMAGE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
-
 fn validate_raster_image(bytes: &[u8]) -> Result<(&'static str, &'static str), ApiError> {
     if bytes.is_empty() {
         return Err(ApiError::BadRequest("Uploaded image is empty".into()));
     }
     if bytes.len() > MAX_BILL_IMAGE_BYTES {
-        return Err(ApiError::BadRequest("File exceeds 10 MiB limit".into()));
+        return Err(ApiError::PayloadTooLarge(
+            "File exceeds 10 MiB limit".into(),
+        ));
     }
 
     const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -466,14 +470,22 @@ async fn upload_bill_image(
     }
 
     let mut image_bytes = None;
-    while let Some(field) = multipart.next_field().await.unwrap_or(None) {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        if e.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::PayloadTooLarge("File exceeds 10 MiB limit".into())
+        } else {
+            ApiError::BadRequest(format!("Failed to parse multipart payload: {e}"))
+        }
+    })? {
         if field.name() == Some("file") {
-            image_bytes = Some(
-                field
-                    .bytes()
-                    .await
-                    .map_err(|_| ApiError::BadRequest("Failed to read file".into()))?,
-            );
+            let bytes = field.bytes().await.map_err(|e| {
+                if e.status() == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+                    ApiError::PayloadTooLarge("File exceeds 10 MiB limit".into())
+                } else {
+                    ApiError::BadRequest(format!("Failed to read file: {e}"))
+                }
+            })?;
+            image_bytes = Some(bytes);
         }
     }
 
@@ -576,7 +588,13 @@ async fn process_ocr(
     };
 
     // 2. Run OCR & Deterministic Bill Parser
-    let (payload, parsed) = crate::ocr::execute_ocr(StdPath::new(&image_path)).await?;
+    let (payload, parsed) = crate::ocr::execute_ocr(
+        StdPath::new(&image_path),
+        state.paddle_ocr_cmd.as_deref(),
+        state.environment,
+        std::time::Duration::from_secs(state.ocr_timeout_secs),
+    )
+    .await?;
 
     let ocr_id = new_id();
     let text_json = serde_json::to_string(&payload.tokens).unwrap_or_else(|_| "[]".to_string());

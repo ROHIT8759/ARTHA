@@ -36,6 +36,8 @@ pub struct Config {
     pub backup_retention: usize,
     pub backup_interval_secs: u64,
     pub upload_dir: PathBuf,
+    pub paddle_ocr_cmd: Option<String>,
+    pub ocr_timeout_secs: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,6 +47,7 @@ pub enum ConfigError {
     InvalidHost(String),
     InvalidBackupRetention(String),
     InvalidBackupInterval(String),
+    InvalidOcrTimeout(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -74,6 +77,12 @@ impl fmt::Display for ConfigError {
                     "ARTHA_BACKUP_INTERVAL_SECS must be a non-negative integer, got {v:?}"
                 )
             }
+            ConfigError::InvalidOcrTimeout(v) => {
+                write!(
+                    f,
+                    "ARTHA_OCR_TIMEOUT_SECS must be a non-negative integer, got {v:?}"
+                )
+            }
         }
     }
 }
@@ -90,6 +99,8 @@ const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_BACKUP_RETENTION: usize = 24;
 /// Default scheduled-backup interval, per spec §9's "hourly" default.
 const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 3600;
+/// Default timeout for local OCR subprocess execution (30 seconds).
+const DEFAULT_OCR_TIMEOUT_SECS: u64 = 30;
 
 impl Config {
     /// Load configuration from the real process environment.
@@ -162,6 +173,17 @@ impl Config {
                     .unwrap_or_else(|| PathBuf::from("uploads"))
             });
 
+        let paddle_ocr_cmd = get("ARTHA_PADDLE_OCR_CMD")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let ocr_timeout_secs = match get("ARTHA_OCR_TIMEOUT_SECS") {
+            Some(raw) => raw
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidOcrTimeout(raw))?,
+            None => DEFAULT_OCR_TIMEOUT_SECS,
+        };
+
         // Resolve eagerly so a typo'd host fails fast at startup rather than
         // on the first incoming connection attempt.
         let _ = format!("{host}:{port}")
@@ -178,6 +200,8 @@ impl Config {
             backup_retention,
             backup_interval_secs,
             upload_dir,
+            paddle_ocr_cmd,
+            ocr_timeout_secs,
         })
     }
 
@@ -213,6 +237,8 @@ mod tests {
         assert_eq!(cfg.backup_retention, 24);
         assert_eq!(cfg.backup_interval_secs, 3600);
         assert_eq!(cfg.upload_dir, PathBuf::from("data/uploads"));
+        assert_eq!(cfg.paddle_ocr_cmd, None);
+        assert_eq!(cfg.ocr_timeout_secs, 30);
     }
 
     #[test]
@@ -227,6 +253,8 @@ mod tests {
             ("ARTHA_BACKUP_RETENTION", "10"),
             ("ARTHA_BACKUP_INTERVAL_SECS", "1800"),
             ("ARTHA_UPLOAD_DIR", "custom/uploads"),
+            ("ARTHA_PADDLE_OCR_CMD", "paddleocr-custom"),
+            ("ARTHA_OCR_TIMEOUT_SECS", "45"),
         ]))
         .unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
@@ -238,6 +266,8 @@ mod tests {
         assert_eq!(cfg.backup_retention, 10);
         assert_eq!(cfg.backup_interval_secs, 1800);
         assert_eq!(cfg.upload_dir, PathBuf::from("custom/uploads"));
+        assert_eq!(cfg.paddle_ocr_cmd.as_deref(), Some("paddleocr-custom"));
+        assert_eq!(cfg.ocr_timeout_secs, 45);
     }
 
     #[test]
@@ -269,6 +299,12 @@ mod tests {
         let err =
             Config::from_lookup(lookup(&[("ARTHA_BACKUP_INTERVAL_SECS", "soon")])).unwrap_err();
         assert_eq!(err, ConfigError::InvalidBackupInterval("soon".to_string()));
+    }
+
+    #[test]
+    fn rejects_invalid_ocr_timeout() {
+        let err = Config::from_lookup(lookup(&[("ARTHA_OCR_TIMEOUT_SECS", "never")])).unwrap_err();
+        assert_eq!(err, ConfigError::InvalidOcrTimeout("never".to_string()));
     }
 
     #[test]

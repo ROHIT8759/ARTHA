@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.7", features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "process", "time"] }
 tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
