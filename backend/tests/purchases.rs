@@ -899,9 +899,9 @@ async fn test_ocr_failure_and_timeout_preserve_draft_and_inventory() {
     }
 
     // 2. Timeout test
-    let temp_dir = std::env::temp_dir();
     #[cfg(windows)]
     let (script_path, hang_cmd) = {
+        let temp_dir = std::env::temp_dir();
         let script = temp_dir.join(format!("test_hang_ocr_route_{}.cmd", std::process::id()));
         std::fs::write(&script, "@ping -n 5 127.0.0.1 >nul\r\n").unwrap();
         let path_str = script.to_string_lossy().to_string();
