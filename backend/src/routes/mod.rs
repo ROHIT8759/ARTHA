@@ -1,3 +1,4 @@
+pub mod backup;
 mod business;
 mod health;
 mod inventory;
@@ -16,6 +17,7 @@ use crate::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(health::router())
+        .merge(backup::router())
         .merge(setup::router())
         .merge(users::router())
         .merge(products::router())

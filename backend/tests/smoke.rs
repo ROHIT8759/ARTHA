@@ -3,8 +3,6 @@
 //! Not a substitute for per-module unit tests, but catches wiring mistakes
 //! (wrong route, wrong status code, missing auth) cheaply and fast.
 
-use std::sync::{Arc, Mutex};
-
 use artha_server::{build_app, db, AppState};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -14,9 +12,7 @@ use tower::ServiceExt;
 
 fn test_app() -> axum::Router {
     let conn = db::open_in_memory();
-    let state = AppState {
-        db: Arc::new(Mutex::new(conn)),
-    };
+    let state = AppState::for_tests(conn);
     build_app(state)
 }
 

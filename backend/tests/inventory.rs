@@ -5,14 +5,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 fn test_app() -> axum::Router {
     let conn = db::open_in_memory();
-    let state = AppState {
-        db: Arc::new(Mutex::new(conn)),
-    };
+    let state = AppState::for_tests(conn);
     build_app(state)
 }
 
@@ -217,9 +214,7 @@ async fn inventory_transactions_and_constraints() {
 #[tokio::test]
 async fn inventory_concurrency_protection() {
     let conn = db::open_in_memory();
-    let state = AppState {
-        db: Arc::new(Mutex::new(conn)),
-    };
+    let state = AppState::for_tests(conn);
     let app = build_app(state);
 
     let token = setup_owner(&app).await;

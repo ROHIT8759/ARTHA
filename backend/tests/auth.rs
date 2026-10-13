@@ -5,14 +5,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
 fn test_app() -> axum::Router {
     let conn = db::open_in_memory();
-    let state = AppState {
-        db: Arc::new(Mutex::new(conn)),
-    };
+    let state = AppState::for_tests(conn);
     build_app(state)
 }
 
@@ -169,9 +166,7 @@ async fn duplicate_setup_race_condition() {
     // However, SQLite with a mutex forces serial execution of the setup requests at the DB layer,
     // so we just test that sending multiple setups concurrently still results in only ONE success.
     let conn = db::open_in_memory();
-    let state = AppState {
-        db: Arc::new(Mutex::new(conn)),
-    };
+    let state = AppState::for_tests(conn);
     let app = build_app(state);
 
     let mut futures = vec![];

@@ -37,7 +37,11 @@ pub fn open_and_migrate(path: &Path) -> Result<Connection, ApiError> {
     Ok(conn)
 }
 
-fn run_migrations(conn: &Connection) -> Result<(), ApiError> {
+/// `pub(crate)` (not private) because `routes::backup`'s restore flow calls
+/// this again after restoring a backup taken on an older schema version —
+/// it's already idempotent/additive (see the tests below), so re-running it
+/// safely brings a restored database forward to the running binary's schema.
+pub(crate) fn run_migrations(conn: &Connection) -> Result<(), ApiError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version     INTEGER PRIMARY KEY,

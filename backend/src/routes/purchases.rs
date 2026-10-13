@@ -1,4 +1,4 @@
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,11 @@ pub struct CreatePurchaseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ListPurchasesQuery {
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdatePurchaseItemReq {
     pub purchase_item_id: Option<String>, // if missing, it's new
     pub product_id: Option<String>,
@@ -80,12 +85,26 @@ pub struct UpdatePurchaseRequest {
 async fn list_purchases(
     State(state): State<AppState>,
     user: AuthUser,
+    Query(query): Query<ListPurchasesQuery>,
 ) -> Result<Json<Vec<PurchaseView>>, ApiError> {
     let conn = state.db.lock().expect("db mutex poisoned");
 
     // Simple list without items to save bandwidth
-    let mut stmt = conn.prepare("SELECT purchase_id, supplier_id, invoice_no, invoice_date, status, source, subtotal_paise, tax_total_paise, total_paise, created_by, created_at FROM purchases WHERE business_id = ?1 ORDER BY created_at DESC")?;
-    let rows = stmt.query_map(rusqlite::params![user.business_id], |r| {
+    let mut sql = "SELECT purchase_id, supplier_id, invoice_no, invoice_date, status, source, subtotal_paise, tax_total_paise, total_paise, created_by, created_at FROM purchases WHERE business_id = ?1".to_string();
+    let mut params: Vec<rusqlite::types::Value> =
+        vec![rusqlite::types::Value::from(user.business_id.clone())];
+
+    if let Some(st) = &query.status {
+        if !st.trim().is_empty() {
+            sql.push_str(" AND status = ?");
+            params.push(rusqlite::types::Value::from(st.trim().to_lowercase()));
+        }
+    }
+
+    sql.push_str(" ORDER BY created_at DESC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
         Ok(PurchaseView {
             purchase_id: r.get(0)?,
             supplier_id: r.get(1)?,

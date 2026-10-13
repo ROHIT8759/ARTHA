@@ -32,6 +32,9 @@ pub struct Config {
     pub db_path: PathBuf,
     pub log_level: String,
     pub environment: Environment,
+    pub backup_dir: PathBuf,
+    pub backup_retention: usize,
+    pub backup_interval_secs: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -39,6 +42,8 @@ pub enum ConfigError {
     InvalidPort(String),
     InvalidEnvironment(String),
     InvalidHost(String),
+    InvalidBackupRetention(String),
+    InvalidBackupInterval(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -56,6 +61,18 @@ impl fmt::Display for ConfigError {
             ConfigError::InvalidHost(v) => {
                 write!(f, "ARTHA_HOST is not a resolvable host, got {v:?}")
             }
+            ConfigError::InvalidBackupRetention(v) => {
+                write!(
+                    f,
+                    "ARTHA_BACKUP_RETENTION must be a non-negative integer, got {v:?}"
+                )
+            }
+            ConfigError::InvalidBackupInterval(v) => {
+                write!(
+                    f,
+                    "ARTHA_BACKUP_INTERVAL_SECS must be a non-negative integer, got {v:?}"
+                )
+            }
         }
     }
 }
@@ -66,6 +83,12 @@ const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_DB_PATH: &str = "data/artha.db";
 const DEFAULT_LOG_LEVEL: &str = "info";
+/// Default: how many hourly-ish backups to keep before pruning the oldest.
+/// 24 covers a full day at the default hourly interval, per spec §9/§10's
+/// "configurable retention, e.g. last N backups".
+const DEFAULT_BACKUP_RETENTION: usize = 24;
+/// Default scheduled-backup interval, per spec §9's "hourly" default.
+const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 3600;
 
 impl Config {
     /// Load configuration from the real process environment.
@@ -93,6 +116,31 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH));
 
+        // Documented default: a `backups/` directory next to the configured
+        // database file, so a fresh install needs no extra configuration.
+        let backup_dir = get("ARTHA_BACKUP_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                db_path
+                    .parent()
+                    .map(|p| p.join("backups"))
+                    .unwrap_or_else(|| PathBuf::from("backups"))
+            });
+
+        let backup_retention = match get("ARTHA_BACKUP_RETENTION") {
+            Some(raw) => raw
+                .parse::<usize>()
+                .map_err(|_| ConfigError::InvalidBackupRetention(raw))?,
+            None => DEFAULT_BACKUP_RETENTION,
+        };
+
+        let backup_interval_secs = match get("ARTHA_BACKUP_INTERVAL_SECS") {
+            Some(raw) => raw
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidBackupInterval(raw))?,
+            None => DEFAULT_BACKUP_INTERVAL_SECS,
+        };
+
         let log_level = get("ARTHA_LOG_LEVEL").unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string());
 
         let environment = match get("ARTHA_ENV") {
@@ -116,6 +164,9 @@ impl Config {
             db_path,
             log_level,
             environment,
+            backup_dir,
+            backup_retention,
+            backup_interval_secs,
         })
     }
 
@@ -147,6 +198,9 @@ mod tests {
         assert_eq!(cfg.db_path, PathBuf::from("data/artha.db"));
         assert_eq!(cfg.log_level, "info");
         assert_eq!(cfg.environment, Environment::Development);
+        assert_eq!(cfg.backup_dir, PathBuf::from("data/backups"));
+        assert_eq!(cfg.backup_retention, 24);
+        assert_eq!(cfg.backup_interval_secs, 3600);
     }
 
     #[test]
@@ -157,6 +211,9 @@ mod tests {
             ("ARTHA_DB_PATH", "custom/path.db"),
             ("ARTHA_LOG_LEVEL", "debug"),
             ("ARTHA_ENV", "production"),
+            ("ARTHA_BACKUP_DIR", "custom/backups"),
+            ("ARTHA_BACKUP_RETENTION", "10"),
+            ("ARTHA_BACKUP_INTERVAL_SECS", "1800"),
         ]))
         .unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
@@ -164,6 +221,33 @@ mod tests {
         assert_eq!(cfg.db_path, PathBuf::from("custom/path.db"));
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.environment, Environment::Production);
+        assert_eq!(cfg.backup_dir, PathBuf::from("custom/backups"));
+        assert_eq!(cfg.backup_retention, 10);
+        assert_eq!(cfg.backup_interval_secs, 1800);
+    }
+
+    #[test]
+    fn backup_dir_defaults_next_to_db_path_when_not_overridden() {
+        let cfg =
+            Config::from_lookup(lookup(&[("ARTHA_DB_PATH", "some/nested/artha.db")])).unwrap();
+        assert_eq!(cfg.backup_dir, PathBuf::from("some/nested/backups"));
+    }
+
+    #[test]
+    fn rejects_invalid_backup_retention() {
+        let err =
+            Config::from_lookup(lookup(&[("ARTHA_BACKUP_RETENTION", "not-a-number")])).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBackupRetention("not-a-number".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_backup_interval() {
+        let err =
+            Config::from_lookup(lookup(&[("ARTHA_BACKUP_INTERVAL_SECS", "soon")])).unwrap_err();
+        assert_eq!(err, ConfigError::InvalidBackupInterval("soon".to_string()));
     }
 
     #[test]

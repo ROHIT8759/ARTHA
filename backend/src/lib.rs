@@ -13,6 +13,7 @@ pub mod logging;
 pub mod models;
 pub mod routes;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -27,6 +28,26 @@ use rusqlite::Connection;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
+    pub backup_dir: PathBuf,
+    pub backup_retention: usize,
+}
+
+impl AppState {
+    /// Convenience constructor for tests that don't exercise backup/restore
+    /// directly: a harmless scratch backup dir (unique per process, so
+    /// parallel `cargo test` runs never collide) and the documented default
+    /// retention. Deliberately not `#[cfg(test)]`-gated — like
+    /// `db::open_in_memory`, integration tests under `tests/` link this
+    /// crate as a normal (non-`cfg(test)`) dependency, so that attribute
+    /// would make this disappear for them, not just for release builds.
+    pub fn for_tests(conn: Connection) -> AppState {
+        AppState {
+            db: Arc::new(Mutex::new(conn)),
+            backup_dir: std::env::temp_dir()
+                .join(format!("artha_test_backups_{}", std::process::id())),
+            backup_retention: 24,
+        }
+    }
 }
 
 /// Build the full router. Used by both `main.rs` and tests.

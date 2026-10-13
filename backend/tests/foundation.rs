@@ -7,7 +7,6 @@
 //! this file is scoped to the infrastructure layer only.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 
 use artha_server::config::{Config, Environment};
 use artha_server::{build_app, db, AppState};
@@ -39,9 +38,7 @@ fn remove_db_and_sidecars(path: &std::path::Path) {
 #[tokio::test]
 async fn application_starts_and_serves_a_request() {
     let conn = db::open_in_memory();
-    let state = AppState {
-        db: Arc::new(Mutex::new(conn)),
-    };
+    let state = AppState::for_tests(conn);
     let app = build_app(state);
 
     let resp = app
@@ -95,9 +92,7 @@ async fn database_initializes_and_runs_migrations_on_a_real_file() {
 #[tokio::test]
 async fn health_endpoint_reports_the_server_is_running() {
     let conn = db::open_in_memory();
-    let state = AppState {
-        db: Arc::new(Mutex::new(conn)),
-    };
+    let state = AppState::for_tests(conn);
     let app = build_app(state);
 
     let resp = app
