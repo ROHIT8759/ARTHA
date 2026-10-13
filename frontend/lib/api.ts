@@ -170,7 +170,12 @@ export const api = {
     request<{ supplier_id: string; name: string; contact?: string; created_at: string }>("/api/suppliers", { method: "POST", body: JSON.stringify({ name, contact }) }),
 
   // --- PURCHASES ---
-  listPurchases: () => request<Array<{ purchase_id: string; supplier_id?: string; invoice_no?: string; invoice_date?: string; status: string; source: string; subtotal_paise: number; tax_total_paise: number; total_paise: number; created_by: string; created_at: string }>>("/api/purchases"),
+  listPurchases: (query?: { status?: string }) => {
+    const params = new URLSearchParams();
+    if (query?.status) params.set("status", query.status);
+    const qs = params.toString();
+    return request<Array<{ purchase_id: string; supplier_id?: string; invoice_no?: string; invoice_date?: string; status: string; source: string; subtotal_paise: number; tax_total_paise: number; total_paise: number; created_by: string; created_at: string }>>(qs ? `/api/purchases?${qs}` : "/api/purchases");
+  },
   getPurchase: (purchaseId: string) => request<{
     purchase_id: string; supplier_id?: string; invoice_no?: string; invoice_date?: string; status: string; source: string; subtotal_paise: number; tax_total_paise: number; total_paise: number; created_by: string; created_at: string;
     items: Array<{
@@ -281,7 +286,39 @@ export const api = {
 
   removeLogo: () =>
     request<BusinessView>("/api/business/logo", { method: "DELETE" }),
+
+  // --- BACKUP & RESTORE (owner-only; Phase 09 / V0.3 Reliability) ---
+  listBackups: () => request<BackupView[]>("/api/backups"),
+
+  createBackup: () => request<BackupView>("/api/backups", { method: "POST" }),
+
+  verifyBackup: (backupId: string) =>
+    request<BackupVerifyResult>(`/api/backups/${backupId}/verify`, { method: "POST" }),
+
+  restoreBackup: (backupId: string, confirm: boolean) =>
+    request<{ status: string; restored_backup_id: string; safety_backup_id: string }>(
+      `/api/backups/${backupId}/restore`,
+      { method: "POST", body: JSON.stringify({ confirm }) }
+    ),
 };
+
+export interface BackupView {
+  backup_id: string;
+  app_version: string;
+  schema_version: number;
+  path: string;
+  checksum_sha256: string;
+  created_at: string;
+  size_bytes: number;
+}
+
+export interface BackupVerifyResult {
+  backup_id: string;
+  checksum_ok: boolean;
+  integrity_ok: boolean;
+  schema_version: number | null;
+  valid: boolean;
+}
 
 export interface SaleItemView {
   sale_item_id: string;
@@ -505,5 +542,21 @@ export function calculateLineTaxPaise(taxablePaise: number, gstRateBps: number):
 export function formatGstRate(rateBps: number): string {
   const isWhole = rateBps % 100 === 0;
   return `${isWhole ? (rateBps / 100).toFixed(0) : (rateBps / 100).toFixed(2)}%`;
+}
+
+/**
+ * Formats a byte count as a human-readable string (e.g. backup file sizes).
+ * Uses binary (1024-based) units, one decimal place above KB.
+ */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(1)} ${units[unitIndex]}`;
 }
 

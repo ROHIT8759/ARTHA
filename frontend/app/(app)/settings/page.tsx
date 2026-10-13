@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef } from "react";
 import { useAuth } from "@/lib/auth-context";
-import { api, BusinessView } from "@/lib/api";
+import { api, BusinessView, BackupView, BackupVerifyResult, formatBytes } from "@/lib/api";
 import LoadingState from "@/components/ui/LoadingState";
 import ErrorState from "@/components/ui/ErrorState";
 
@@ -36,6 +36,15 @@ export default function SettingsPage() {
   // Logo state
   const [logoUploading, setLogoUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Backup & restore state
+  const [backups, setBackups] = useState<BackupView[]>([]);
+  const [backupsLoading, setBackupsLoading] = useState(false);
+  const [backupsError, setBackupsError] = useState<string | null>(null);
+  const [creatingBackup, setCreatingBackup] = useState(false);
+  const [backupActionId, setBackupActionId] = useState<string | null>(null);
+  const [verifyResults, setVerifyResults] = useState<Record<string, BackupVerifyResult>>({});
+  const [backupFeedback, setBackupFeedback] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -82,6 +91,110 @@ export default function SettingsPage() {
       mounted = false;
     };
   }, [user?.role]);
+
+  const loadBackups = async () => {
+    try {
+      setBackupsLoading(true);
+      const data = await api.listBackups();
+      setBackups(data);
+      setBackupsError(null);
+    } catch (err: unknown) {
+      setBackupsError(err instanceof Error ? err.message : "Failed to load backups");
+    } finally {
+      setBackupsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    let mounted = true;
+    const load = async () => {
+      try {
+        setBackupsLoading(true);
+        const data = await api.listBackups();
+        if (mounted) {
+          setBackups(data);
+          setBackupsError(null);
+        }
+      } catch (err: unknown) {
+        if (mounted) {
+          setBackupsError(err instanceof Error ? err.message : "Failed to load backups");
+        }
+      } finally {
+        if (mounted) setBackupsLoading(false);
+      }
+    };
+
+    if (user?.role === "owner") {
+      load();
+    }
+
+    return () => {
+      mounted = false;
+    };
+  }, [user?.role]);
+
+  const handleCreateBackup = async () => {
+    setCreatingBackup(true);
+    setBackupFeedback(null);
+    try {
+      const created = await api.createBackup();
+      setBackups((prev) => [created, ...prev]);
+      setBackupFeedback({ type: "success", text: `Backup created (${formatBytes(created.size_bytes)}).` });
+    } catch (err: unknown) {
+      setBackupFeedback({
+        type: "error",
+        text: err instanceof Error ? err.message : "Failed to create backup",
+      });
+    } finally {
+      setCreatingBackup(false);
+    }
+  };
+
+  const handleVerifyBackup = async (backupId: string) => {
+    setBackupActionId(backupId);
+    setBackupFeedback(null);
+    try {
+      const result = await api.verifyBackup(backupId);
+      setVerifyResults((prev) => ({ ...prev, [backupId]: result }));
+    } catch (err: unknown) {
+      setBackupFeedback({
+        type: "error",
+        text: err instanceof Error ? err.message : "Failed to verify backup",
+      });
+    } finally {
+      setBackupActionId(null);
+    }
+  };
+
+  const handleRestoreBackup = async (backup: BackupView) => {
+    const confirmed = confirm(
+      `Restore the database to the state from ${new Date(backup.created_at).toLocaleString()}?\n\n` +
+        "This replaces ALL current data (products, sales, purchases, settings) with that backup's contents. " +
+        "A safety backup of the current state is taken automatically first, so this can be undone by restoring " +
+        "that safety backup afterward.\n\nThis cannot be skipped or undone immediately. Continue?"
+    );
+    if (!confirmed) return;
+
+    setBackupActionId(backup.backup_id);
+    setBackupFeedback(null);
+    try {
+      const result = await api.restoreBackup(backup.backup_id, true);
+      setBackupFeedback({
+        type: "success",
+        text: `Database restored. A safety backup of the prior state was saved (id: ${result.safety_backup_id}). Reloading...`,
+      });
+      // Virtually every piece of app state (products, sales, settings, auth
+      // session rows) may have just changed underneath the running app;
+      // a full reload is the only way to guarantee nothing stale is shown.
+      setTimeout(() => window.location.reload(), 1500);
+    } catch (err: unknown) {
+      setBackupFeedback({
+        type: "error",
+        text: err instanceof Error ? err.message : "Failed to restore backup",
+      });
+      setBackupActionId(null);
+    }
+  };
 
   if (user?.role !== "owner") {
     return (
@@ -453,6 +566,111 @@ export default function SettingsPage() {
           {saving ? "Saving Changes..." : "💾 Save Settings"}
         </button>
       </form>
+
+      {/* Backup & Restore */}
+      <div className="card" style={{ marginTop: "2rem" }}>
+        <h2 style={{ fontSize: "1.2rem", marginTop: 0, borderBottom: "1px solid var(--border)", paddingBottom: "0.5rem" }}>
+          💾 Backup & Restore
+        </h2>
+        <p className="muted" style={{ fontSize: "0.9rem", marginTop: 0 }}>
+          Local backups are taken automatically on a schedule and can also be created on demand. Restoring
+          replaces all current data with a backup&apos;s contents; a safety backup of the current state is
+          always taken first.
+        </p>
+
+        {backupFeedback && (
+          <div
+            style={{
+              marginBottom: "1rem",
+              padding: "0.65rem 0.85rem",
+              borderRadius: 6,
+              border: `1px solid ${backupFeedback.type === "success" ? "var(--accent)" : "var(--danger)"}`,
+              backgroundColor: backupFeedback.type === "success" ? "rgba(15,107,76,0.08)" : "rgba(179,38,30,0.08)",
+            }}
+          >
+            <strong style={{ color: backupFeedback.type === "success" ? "var(--accent)" : "var(--danger)" }}>
+              {backupFeedback.text}
+            </strong>
+          </div>
+        )}
+
+        <button
+          type="button"
+          className="btn"
+          onClick={handleCreateBackup}
+          disabled={creatingBackup}
+          style={{ marginBottom: "1.25rem" }}
+        >
+          {creatingBackup ? "Creating Backup..." : "📦 Create Backup Now"}
+        </button>
+
+        {backupsLoading && backups.length === 0 ? (
+          <LoadingState message="Loading backups..." />
+        ) : backupsError && backups.length === 0 ? (
+          <ErrorState message={backupsError} onRetry={loadBackups} />
+        ) : backups.length === 0 ? (
+          <p className="muted">No backups yet. Create one above, or wait for the next scheduled backup.</p>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>Created</th>
+                <th>Size</th>
+                <th>Schema</th>
+                <th>Status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {backups.map((b) => {
+                const verify = verifyResults[b.backup_id];
+                const busy = backupActionId === b.backup_id;
+                return (
+                  <tr key={b.backup_id}>
+                    <td>{new Date(b.created_at).toLocaleString()}</td>
+                    <td>{formatBytes(b.size_bytes)}</td>
+                    <td>v{b.schema_version}</td>
+                    <td>
+                      {verify === undefined ? (
+                        <span className="muted">Not checked</span>
+                      ) : verify.valid ? (
+                        <span style={{ color: "var(--accent)" }}>✓ Valid</span>
+                      ) : (
+                        <span style={{ color: "var(--danger)" }}>
+                          ✗ Invalid
+                          {!verify.checksum_ok ? " (checksum)" : ""}
+                          {!verify.integrity_ok ? " (integrity)" : ""}
+                        </span>
+                      )}
+                    </td>
+                    <td>
+                      <div style={{ display: "flex", gap: "0.5rem" }}>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          disabled={busy}
+                          onClick={() => handleVerifyBackup(b.backup_id)}
+                        >
+                          {busy && backupActionId === b.backup_id ? "..." : "Verify"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          disabled={busy}
+                          style={{ color: "var(--danger)", borderColor: "var(--danger)" }}
+                          onClick={() => handleRestoreBackup(b)}
+                        >
+                          Restore
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
     </div>
   );
 }

@@ -7,6 +7,7 @@ import {
   calculateItemSubtotalPaise,
   calculateLineTaxPaise,
   formatGstRate,
+  formatBytes,
 } from "../lib/api.ts";
 
 describe("formatPaise - Indian Currency Formatter", () => {
@@ -235,6 +236,33 @@ describe("formatGstRate - GST Rate Percentage Formatter", () => {
     assert.equal(formatGstRate(250), "2.50%");
     assert.equal(formatGstRate(125), "1.25%");
     assert.equal(formatGstRate(75), "0.75%");
+  });
+});
+
+describe("formatBytes - Backup File Size Formatter", () => {
+  test("formats sub-kilobyte sizes as plain bytes", () => {
+    assert.equal(formatBytes(0), "0 B");
+    assert.equal(formatBytes(512), "512 B");
+    assert.equal(formatBytes(1023), "1023 B");
+  });
+
+  test("formats kilobytes with one decimal place", () => {
+    assert.equal(formatBytes(1024), "1.0 KB");
+    assert.equal(formatBytes(1536), "1.5 KB");
+    assert.equal(formatBytes(1024 * 999), "999.0 KB");
+  });
+
+  test("formats megabytes once kilobytes exceed 1024", () => {
+    assert.equal(formatBytes(1024 * 1024), "1.0 MB");
+    assert.equal(formatBytes(1024 * 1024 * 2.5), "2.5 MB");
+  });
+
+  test("formats gigabytes once megabytes exceed 1024", () => {
+    assert.equal(formatBytes(1024 * 1024 * 1024 * 3), "3.0 GB");
+  });
+
+  test("never exceeds the largest defined unit (GB)", () => {
+    assert.equal(formatBytes(1024 * 1024 * 1024 * 1024), "1024.0 GB");
   });
 });
 
