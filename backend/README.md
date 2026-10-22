@@ -28,6 +28,18 @@ to set):
 | `ARTHA_LOG_LEVEL` | `info` | tracing log level, e.g. `debug` |
 | `ARTHA_ENV` | `development` | `development` or `production` — controls log formatting (ANSI colors in dev, plain in prod) |
 | `RUST_LOG` | — | if set, overrides `ARTHA_LOG_LEVEL` with the usual `tracing_subscriber` filter syntax, e.g. `artha_server=debug` |
+| `ARTHA_UPLOAD_DIR` | `uploads/` next to `ARTHA_DB_PATH` | where purchase bill photos are stored (content-addressed by SHA-256). **Not included in database backups.** |
+| `ARTHA_PADDLE_OCR_CMD` | — | path to a single executable run as `<cmd> <image-path>` that prints a JSON array of `{text, confidence}` tokens on stdout. Arguments cannot be embedded in the value; use a wrapper script. |
+| `ARTHA_OCR_TIMEOUT_SECS` | `30` | how long an OCR run may take before it is abandoned |
+
+**OCR and `ARTHA_ENV`.** When `ARTHA_PADDLE_OCR_CMD` is unset, a server running with
+`ARTHA_ENV=production` refuses OCR requests with a clear error. Any other value, **including
+the default `development`**, returns canned sample bill data that is *not read from the
+photo* (the OCR response sets `is_dev_fixture: true` and the purchase screen warns about it).
+Production installs must set `ARTHA_ENV=production`.
+
+On timeout only the OCR command itself is killed; processes it started (for example the
+interpreter behind a wrapper script) keep running until they exit on their own.
 
 The database is created and migrated automatically on first start. There
 is no separate "init" step — `POST /api/setup` (called once by the

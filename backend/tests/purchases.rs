@@ -986,3 +986,333 @@ async fn test_ocr_failure_and_timeout_preserve_draft_and_inventory() {
         let _ = std::fs::remove_file(p);
     }
 }
+
+/// A file starting with the PNG signature, padded to exactly `n` bytes.
+fn png_of_size(n: usize) -> Vec<u8> {
+    let mut v = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    v.resize(n, 0x00);
+    v
+}
+
+async fn create_ocr_draft(app: &axum::Router, token: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/purchases",
+            Some(token),
+            json!({ "source": "ocr" }),
+        ))
+        .await
+        .unwrap();
+    body_json(resp).await["purchase_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn test_bill_image_limit_is_exactly_10_mib_of_file_data() {
+    // The route's body limit counts the multipart framing too, so a file of exactly
+    // 10 MiB used to be rejected. The limit is on the file: 10 MiB passes, 10 MiB + 1 fails.
+    const TEN_MIB: usize = 10 * 1024 * 1024;
+    let mut state = AppState::for_tests(db::open_in_memory());
+    let dir = std::env::temp_dir().join(format!("artha_limit_test_{}", std::process::id()));
+    state.upload_dir = dir.clone();
+    let db_ref = state.db.clone();
+    let app = build_app(state);
+    let token = setup_owner(&app).await;
+    let purchase_id = create_ocr_draft(&app, &token).await;
+    let uri = format!("/api/purchases/{purchase_id}/image");
+
+    for (label, size, expected) in [
+        ("10 MiB - 1", TEN_MIB - 1, StatusCode::OK),
+        ("exactly 10 MiB", TEN_MIB, StatusCode::OK),
+        ("10 MiB + 1", TEN_MIB + 1, StatusCode::PAYLOAD_TOO_LARGE),
+        // Beyond the envelope allowance the body-limit layer itself must reject it.
+        (
+            "10 MiB + 128 KiB",
+            TEN_MIB + 128 * 1024,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(multipart_image_request(
+                &uri,
+                &token,
+                "bill.png",
+                png_of_size(size),
+                "image/png",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "{label} ({size} bytes)");
+        if expected == StatusCode::OK {
+            let body = body_json(resp).await;
+            assert_eq!(body["size_bytes"], size, "{label}");
+        } else {
+            let body = body_json(resp).await;
+            assert_eq!(body["message"], "File exceeds 10 MiB limit", "{label}");
+        }
+    }
+
+    // Rejected uploads leave neither a row nor a file behind.
+    let rows: i64 = db_ref
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM bill_images", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn test_bill_image_endpoints_require_auth_and_are_scoped_to_the_business() {
+    let state = AppState::for_tests(db::open_in_memory());
+    let db_ref = state.db.clone();
+    let app = build_app(state);
+    let token_a = setup_owner(&app).await;
+    let purchase_id = create_ocr_draft(&app, &token_a).await;
+    let valid_png = png_of_size(64);
+
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token_a,
+            "bill.png",
+            valid_png.clone(),
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let image_id = body_json(resp).await["image_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A second business with its own owner session (the setup API only allows one
+    // business per server, so it is inserted directly).
+    let token_b = {
+        let conn = db_ref.lock().unwrap();
+        let ts = "2026-01-01T00:00:00.000Z";
+        conn.execute(
+            "INSERT INTO businesses (business_id, name, settings_json, created_at, updated_at) VALUES ('biz-b', 'Shop B', '{}', ?1, ?1)",
+            [ts],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (user_id, business_id, username, password_hash, role, status, created_at, updated_at) VALUES ('user-b', 'biz-b', 'other', 'x', 'owner', 'active', ?1, ?1)",
+            [ts],
+        )
+        .unwrap();
+        artha_server::auth::create_session(&conn, "user-b")
+            .unwrap()
+            .0
+    };
+
+    let image_uri = format!("/api/purchases/{purchase_id}/image");
+    let ocr_uri = format!("/api/purchases/{purchase_id}/ocr");
+
+    // Unauthenticated: every bill-image endpoint answers 401.
+    let get = |token: Option<&str>, uri: &str| {
+        let mut b = Request::builder().method("GET").uri(uri.to_string());
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).unwrap()
+    };
+    let resp = app.clone().oneshot(get(None, &image_uri)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&image_uri)
+                .header("content-type", "multipart/form-data; boundary=x")
+                .body(Body::from("--x--\r\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &ocr_uri,
+            None,
+            json!({ "image_id": image_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Business B cannot see, attach to, or OCR business A's purchase or image, and the
+    // errors reveal nothing about where files live.
+    let resp = app
+        .clone()
+        .oneshot(get(Some(&token_b), &image_uri))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let msg = body_json(resp).await["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!msg.contains("upload") && !msg.contains(".png"), "{msg}");
+
+    let resp = app
+        .clone()
+        .oneshot(get(
+            Some(&token_b),
+            &format!("/api/purchases/{purchase_id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &image_uri,
+            &token_b,
+            "bill.png",
+            valid_png.clone(),
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &ocr_uri,
+            Some(&token_b),
+            json!({ "image_id": image_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Nothing was attached by B, and A still reads its own image.
+    let rows: i64 = db_ref
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM bill_images", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+    let resp = app
+        .clone()
+        .oneshot(get(Some(&token_a), &image_uri))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.as_ref(), valid_png.as_slice());
+}
+
+#[tokio::test]
+async fn test_ocr_response_flags_development_fixture_data() {
+    // With no engine configured outside production the server returns canned sample data.
+    // The response must say so, so a client can never present it as a real scan.
+    let app = test_app();
+    let token = setup_owner(&app).await;
+    let purchase_id = create_ocr_draft(&app, &token).await;
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token,
+            "bill.png",
+            png_of_size(64),
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    let image_id = body_json(resp).await["image_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{purchase_id}/ocr"),
+            Some(&token),
+            json!({ "image_id": image_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["is_dev_fixture"], true);
+    assert_eq!(body["engine_version"], "artha_ocr_dev_fixture_v1");
+}
+
+#[tokio::test]
+async fn test_ocr_engine_failure_response_does_not_leak_server_paths() {
+    let mut state = AppState::for_tests(db::open_in_memory());
+    state.paddle_ocr_cmd = Some("/definitely/missing/dir/ocr-engine".to_string());
+    let app = build_app(state);
+    let token = setup_owner(&app).await;
+    let purchase_id = create_ocr_draft(&app, &token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token,
+            "bill.png",
+            png_of_size(64),
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    let image_id = body_json(resp).await["image_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{purchase_id}/ocr"),
+            Some(&token),
+            json!({ "image_id": image_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let msg = body_json(resp).await["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        msg.contains("Failed to start the configured OCR engine"),
+        "{msg}"
+    );
+    assert!(!msg.contains("definitely"), "command path leaked: {msg}");
+    assert!(!msg.contains("os error"), "OS error leaked: {msg}");
+
+    // The draft stays available for manual entry.
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/api/purchases/{purchase_id}"),
+            Some(&token),
+            json!({ "invoice_no": "MANUAL-1", "items": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

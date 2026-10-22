@@ -13,6 +13,12 @@ use crate::AppState;
 
 pub const MAX_BILL_IMAGE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
+/// `DefaultBodyLimit` counts the whole request body, including the multipart boundary
+/// and part headers, not just the file. Without headroom a file of exactly 10 MiB (or
+/// up to a few hundred bytes under it) is wrongly rejected. The exact per-file limit is
+/// enforced separately in `validate_raster_image`.
+const MULTIPART_ENVELOPE_ALLOWANCE: usize = 64 * 1024;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/purchases", get(list_purchases).post(create_purchase))
@@ -26,7 +32,9 @@ pub fn router() -> Router<AppState> {
             "/api/purchases/:id/image",
             get(get_bill_image)
                 .post(upload_bill_image)
-                .layer(DefaultBodyLimit::max(MAX_BILL_IMAGE_BYTES)),
+                .layer(DefaultBodyLimit::max(
+                    MAX_BILL_IMAGE_BYTES + MULTIPART_ENVELOPE_ALLOWANCE,
+                )),
         )
         .route("/api/purchases/:id/ocr", post(process_ocr))
 }
@@ -611,6 +619,10 @@ async fn process_ocr(
     Ok(Json(serde_json::json!({
         "status": "completed",
         "ocr_id": ocr_id,
+        // True when canned development data was returned instead of reading the image
+        // (no OCR engine configured and ARTHA_ENV is not `production`).
+        "is_dev_fixture": payload.engine_version == crate::ocr::DEV_FIXTURE_ENGINE_VERSION,
+        "engine_version": payload.engine_version,
         "parsed": parsed,
     })))
 }
