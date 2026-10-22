@@ -203,7 +203,9 @@ export const api = {
   uploadBillImage: async (purchaseId: string, file: File) => {
     const formData = new FormData();
     formData.append("file", file);
-    const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
+    // Must use the same storage key as the rest of the client (TOKEN_KEY); reading a
+    // different key sends no Authorization header and the server answers 401.
+    const token = getToken();
     const res = await fetch(`${API_BASE}/api/purchases/${purchaseId}/image`, {
       method: "POST",
       headers: token ? { "Authorization": `Bearer ${token}` } : {},
@@ -222,12 +224,37 @@ export const api = {
     return res.json() as Promise<{ image_id: string; sha256: string; mime: string }>;
   },
   
-  getBillImageUrl: (purchaseId: string) => `${API_BASE}/api/purchases/${purchaseId}/image`,
-  
+  /**
+   * Fetch the attached bill image as a Blob. The endpoint requires an
+   * `Authorization: Bearer` header, which a plain `<img src>` cannot send, so the
+   * page renders the image from an object URL created from this Blob.
+   */
+  fetchBillImageBlob: async (purchaseId: string): Promise<Blob> => {
+    const token = getToken();
+    const res = await fetch(`${API_BASE}/api/purchases/${purchaseId}/image`, {
+      headers: token ? { "Authorization": `Bearer ${token}` } : {},
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      let message = res.statusText || "Failed to load bill image";
+      try {
+        const errJson = await res.json();
+        if (errJson?.message) message = errJson.message;
+      } catch {
+        // keep the status text
+      }
+      throw new ApiError(res.status, message);
+    }
+    return res.blob();
+  },
+
   processOcr: (purchaseId: string, imageId: string) =>
     request<{
       status: string;
       ocr_id: string;
+      /** True when the server returned canned development data instead of reading the image. */
+      is_dev_fixture?: boolean;
+      engine_version?: string;
       parsed: ParsedOcrBill;
     }>(`/api/purchases/${purchaseId}/ocr`, {
       method: "POST",

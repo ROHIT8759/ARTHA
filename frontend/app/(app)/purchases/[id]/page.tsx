@@ -6,6 +6,7 @@ import Link from "next/link";
 import { api, formatPaise, ProductView, ParsedOcrBill } from "@/lib/api";
 import LoadingState from "@/components/ui/LoadingState";
 import ErrorState from "@/components/ui/ErrorState";
+import BillImage from "@/components/purchases/BillImage";
 
 export default function PurchaseDetailPage() {
   const params = useParams();
@@ -39,6 +40,7 @@ export default function PurchaseDetailPage() {
     }>
   >([]);
   const [parsedOcr, setParsedOcr] = useState<ParsedOcrBill | null>(null);
+  const [ocrIsFixture, setOcrIsFixture] = useState(false);
   const [saving, setSaving] = useState(false);
   const [approving, setApproving] = useState(false);
   const [ocrProcessing, setOcrProcessing] = useState(false);
@@ -128,12 +130,25 @@ export default function PurchaseDetailPage() {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    // OCR suggestions replace the current line items, so never discard manual
+    // work without asking.
+    if (
+      items.length > 0 &&
+      !confirm(
+        `This draft already has ${items.length} line item(s). Scanning will replace them with the OCR suggestions. Continue?`
+      )
+    ) {
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
+
     setOcrProcessing(true);
     setError(null);
     try {
       const { image_id } = await api.uploadBillImage(purchaseId, file);
       const ocrRes = await api.processOcr(purchaseId, image_id);
 
+      setOcrIsFixture(ocrRes.is_dev_fixture === true);
       if (ocrRes.parsed) {
         setParsedOcr(ocrRes.parsed);
         if (ocrRes.parsed.invoice_no) {
@@ -161,6 +176,13 @@ export default function PurchaseDetailPage() {
       setPurchase(refreshed);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "OCR Processing failed");
+      // The photo may already be attached even though OCR failed: show it so the
+      // draft can be completed by hand (or re-scanned) without a page reload.
+      try {
+        setPurchase(await api.getPurchase(purchaseId));
+      } catch {
+        // keep the original error message
+      }
     } finally {
       setOcrProcessing(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -264,8 +286,53 @@ export default function PurchaseDetailPage() {
         </div>
       )}
 
+      {isDraft && ocrIsFixture && (
+        <div
+          role="alert"
+          style={{
+            background: "rgba(179, 38, 30, 0.08)",
+            border: "1px solid var(--danger)",
+            color: "var(--danger)",
+            padding: "0.6rem 0.8rem",
+            borderRadius: 4,
+            marginBottom: "1rem",
+            fontSize: "0.9rem",
+          }}
+        >
+          <strong>Sample data, not read from your photo.</strong> This server has no OCR engine
+          configured and is not in production mode, so these items are made-up examples. Do not
+          approve them; enter the real bill details instead.
+        </div>
+      )}
+
+      {isDraft && parsedOcr && (
+        <div
+          role="note"
+          style={{
+            background: "#fef7e0",
+            color: "#b06000",
+            padding: "0.6rem 0.8rem",
+            borderRadius: 4,
+            marginBottom: "1rem",
+            fontSize: "0.9rem",
+          }}
+        >
+          <strong>OCR suggestions are not verified.</strong> Check every field against the bill photo before
+          approving. Confidence shows how sure the reader is, not that the value is correct.
+        </div>
+      )}
+
       {/* Split View: Bill Preview + Invoice Review */}
-      <div style={{ display: "grid", gridTemplateColumns: purchase.image_id ? "1fr 1.6fr" : "1fr", gap: "1.5rem", marginBottom: "2rem" }}>
+      <div
+        style={{
+          display: "grid",
+          // Two columns when there is room; stacks on narrow (phone) screens instead of
+          // squeezing the photo and clipping the metadata card.
+          gridTemplateColumns: purchase.image_id ? "repeat(auto-fit, minmax(min(100%, 340px), 1fr))" : "1fr",
+          gap: "1.5rem",
+          marginBottom: "2rem",
+        }}
+      >
         {purchase.image_id && (
           <div className="card" style={{ display: "flex", flexDirection: "column" }}>
             <h3 style={{ marginTop: 0 }}>📷 Attached Bill Photo</h3>
@@ -283,12 +350,7 @@ export default function PurchaseDetailPage() {
                 alignItems: "center",
               }}
             >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={api.getBillImageUrl(purchaseId)}
-                alt="Original Bill"
-                style={{ maxWidth: "100%", height: "auto", display: "block" }}
-              />
+              <BillImage purchaseId={purchaseId} imageId={purchase.image_id} />
             </div>
           </div>
         )}
@@ -305,9 +367,9 @@ export default function PurchaseDetailPage() {
                 disabled={!isDraft}
                 placeholder="e.g. INV-2026-089"
               />
-              {parsedOcr?.invoice_no_confidence && (
+              {(parsedOcr?.invoice_no_confidence ?? 0) > 0 && (
                 <span className="muted" style={{ fontSize: "0.75rem", marginTop: "0.2rem", display: "block" }}>
-                  Confidence: {Math.round(parsedOcr.invoice_no_confidence * 100)}%
+                  OCR suggestion, not verified (confidence {Math.round((parsedOcr?.invoice_no_confidence ?? 0) * 100)}%)
                 </span>
               )}
             </div>
@@ -382,7 +444,8 @@ export default function PurchaseDetailPage() {
           </div>
         )}
 
-        <table style={{ width: "100%", marginTop: "1rem" }}>
+        <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", minWidth: 520, marginTop: "1rem" }}>
           <thead>
             <tr>
               <th style={{ textAlign: "left" }}>Extracted Name / Catalog Product</th>
@@ -443,10 +506,10 @@ export default function PurchaseDetailPage() {
                         display: "inline-block",
                         fontSize: "0.75rem",
                         marginTop: "0.2rem",
-                        color: it.confidence >= 0.85 ? "var(--accent)" : "var(--danger)",
+                        color: it.confidence >= 0.85 ? "inherit" : "var(--danger)",
                       }}
                     >
-                      OCR Confidence: {Math.round(it.confidence * 100)}%
+                      OCR suggestion, not verified (confidence {Math.round(it.confidence * 100)}%)
                     </span>
                   )}
                 </td>
@@ -503,6 +566,7 @@ export default function PurchaseDetailPage() {
             ))}
           </tbody>
         </table>
+        </div>
 
         {isDraft && (
           <div style={{ marginTop: "1rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
