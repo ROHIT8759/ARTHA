@@ -31,7 +31,18 @@ async fn main() {
         environment: config.environment,
         paddle_ocr_cmd: config.paddle_ocr_cmd.clone(),
         ocr_timeout_secs: config.ocr_timeout_secs,
+        ocr_use_dev_fixtures: config.ocr_use_dev_fixtures,
+        ocr_permits: Arc::new(tokio::sync::Semaphore::new(config.ocr_max_concurrency)),
     };
+    if config.ocr_use_dev_fixtures && !config.dev_fixtures_active() {
+        tracing::warn!(
+            "ARTHA_OCR_USE_DEV_FIXTURES is set but ARTHA_ENV is production: the flag is ignored and no sample OCR data will ever be served"
+        );
+    } else if config.dev_fixtures_active() && config.paddle_ocr_cmd.is_none() {
+        tracing::warn!(
+            "ARTHA_OCR_USE_DEV_FIXTURES is on and no OCR engine is configured: OCR requests will return made-up sample data, not text read from the photo"
+        );
+    }
     spawn_backup_scheduler(state.clone(), config.backup_interval_secs);
     let app = build_app(state);
 

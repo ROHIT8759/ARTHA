@@ -40,6 +40,29 @@ jobs:
       - name: Run Tests (cargo test)
         run: cargo test
 
+  # Windows is a supported target and the OCR process-tree termination uses a Windows Job
+  # Object there, which the Linux job cannot exercise. Tests only: fmt/clippy run on Linux.
+  backend-windows:
+    name: Backend (Rust, Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend -> target
+
+      - name: Run Tests (cargo test)
+        run: cargo test
+
   frontend:
     name: Frontend (Next.js)
     runs-on: ubuntu-latest

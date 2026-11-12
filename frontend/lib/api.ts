@@ -183,6 +183,8 @@ export const api = {
   },
   getPurchase: (purchaseId: string) => request<{
     purchase_id: string; supplier_id?: string; invoice_no?: string; invoice_date?: string; status: string; source: string; subtotal_paise: number; tax_total_paise: number; total_paise: number; created_by: string; created_at: string; image_id?: string;
+    /** True if any OCR run on this purchase returned canned development data. */
+    ocr_is_dev_fixture?: boolean;
     items: Array<{
       purchase_item_id: string;
       product_id?: string;
@@ -352,12 +354,20 @@ export const api = {
       restored_backup_id: string;
       safety_backup_id: string;
       current_session_still_valid: boolean;
+      /** Bill photos restored alongside the database. */
+      images?: RestoreImagesReport;
     }>(`/api/backups/${backupId}/restore`, { method: "POST", body: JSON.stringify({ confirm }) }),
 };
 
 export interface ParsedOcrItem {
   product_name_snapshot: string;
   quantity_milli: number;
+  /** False when OCR could not tell the billed quantity from a pack size (e.g. "5kg"). */
+  quantity_certain?: boolean;
+  /** Pack size / unit text seen next to the quantity, e.g. "5kg". */
+  pack_size?: string;
+  /** Plain-language reason the quantity needs review. */
+  quantity_note?: string;
   price_paise: number;
   gst_rate_bps: number;
   confidence: number;
@@ -382,6 +392,42 @@ export interface BackupView {
   checksum_sha256: string;
   created_at: string;
   size_bytes: number;
+  /** True when the backup carries its bill photos; older backups are database-only. */
+  images_included?: boolean;
+  image_count?: number;
+  /** Photos the database refers to that could not be stored with the backup. */
+  images_missing?: number;
+}
+
+export interface RestoreImagesReport {
+  included: boolean;
+  restored: number;
+  already_present: number;
+  /** Photos the restored data refers to that are not available on disk. */
+  missing: number;
+}
+
+/** Short description of the bill photos held by a backup, for the backup list. */
+export function describeBackupPhotos(b: Pick<BackupView, "images_included" | "image_count" | "images_missing">): string {
+  if (!b.images_included) return "Database only";
+  const n = b.image_count ?? 0;
+  const base = `${n} photo${n === 1 ? "" : "s"}`;
+  const missing = b.images_missing ?? 0;
+  return missing > 0 ? `${base}, ${missing} missing` : base;
+}
+
+/** Sentence about photos to append to the "restored" message; empty when there is nothing to say. */
+export function describeRestoredPhotos(images: RestoreImagesReport | undefined): string {
+  if (!images) return "";
+  const parts: string[] = [];
+  if (images.restored > 0) parts.push(`${images.restored} bill photo${images.restored === 1 ? "" : "s"} restored`);
+  if (images.missing > 0) {
+    parts.push(
+      `WARNING: ${images.missing} bill photo${images.missing === 1 ? " is" : "s are"} not available on this computer` +
+        (images.included ? " (they were already missing when the backup was made)" : " (this backup was made before photos were included)")
+    );
+  }
+  return parts.length ? " " + parts.join("; ") + "." : "";
 }
 
 export interface BackupVerifyResult {
@@ -390,6 +436,9 @@ export interface BackupVerifyResult {
   integrity_ok: boolean;
   schema_version: number | null;
   valid: boolean;
+  /** Present on servers that back up bill photos. */
+  images_included?: boolean;
+  images_ok?: boolean;
 }
 
 export interface SaleItemView {

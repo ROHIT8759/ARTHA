@@ -10,9 +10,15 @@
 //! 3. Deterministic parsing: Uses zero-dependency string heuristics for Indian invoice
 //!    structures (GSTIN, Invoice No, Date, HSN, Tax Slabs, Tabular Item Lines).
 
+use crate::config::Environment;
 use crate::error::ApiError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
+
+pub mod runner;
 
 /// `engine_version` reported when canned development data is returned instead of reading
 /// the image. API clients use it to flag such results as fake.
@@ -36,10 +42,304 @@ pub struct OcrResultPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ParsedBillItem {
     pub product_name_snapshot: String,
+    /// Suggested billed quantity in thousandths. Only meaningful as a *claim about the
+    /// bill* when `quantity_certain` is true; otherwise it is a placeholder (1000 = one
+    /// pack, or the number found next to a multiplier) that a person must confirm.
     pub quantity_milli: i64,
+    /// False when the text could not reliably distinguish the billed quantity from a
+    /// pack size or unit (for example `5kg`), so the suggestion must be reviewed.
+    pub quantity_certain: bool,
+    /// Pack size / unit text seen next to the quantity position, e.g. `5kg`, `1L`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pack_size: Option<String>,
+    /// Plain-language reason the quantity needs review.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub quantity_note: Option<String>,
     pub price_paise: i64,
     pub gst_rate_bps: i64,
     pub confidence: f32,
+}
+
+/// Largest quantity accepted from OCR text: 1,000,000 units (in thousandths).
+const MAX_QUANTITY_MILLI: i64 = 1_000_000_000;
+/// Largest unit price accepted from OCR text: 1e11 paise (Rs 100 crore). With the quantity
+/// cap, a line total stays far below `i64::MAX`.
+const MAX_ITEM_PRICE_PAISE: i64 = 100_000_000_000;
+
+/// Units that count things. `12 pcs` means twelve of them.
+const COUNT_UNITS: &[&str] = &[
+    "pc", "pcs", "piece", "pieces", "no", "nos", "unit", "units", "pkt", "pkts", "packet",
+    "packets", "box", "boxes", "btl", "btls", "bottle", "bottles", "bag", "bags", "doz", "dozen",
+    "ctn", "carton", "cartons", "set", "sets", "pair", "pairs", "jar", "jars", "tin", "tins",
+    "can", "cans",
+];
+
+/// Units that measure weight / volume / length. Next to a product name (`Rice 5kg`) they
+/// usually describe the *pack*, not how many packs were billed.
+const MEASURE_UNITS: &[&str] = &[
+    "kg", "kgs", "g", "gm", "gms", "gram", "grams", "mg", "l", "lt", "ltr", "ltrs", "litre",
+    "litres", "liter", "liters", "ml", "oz", "lb", "lbs", "m", "mtr", "mtrs", "cm",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnitKind {
+    Count,
+    Measure,
+}
+
+fn classify_unit(unit: &str) -> Option<UnitKind> {
+    let u = unit.to_ascii_lowercase();
+    if COUNT_UNITS.contains(&u.as_str()) {
+        Some(UnitKind::Count)
+    } else if MEASURE_UNITS.contains(&u.as_str()) {
+        Some(UnitKind::Measure)
+    } else {
+        None
+    }
+}
+
+/// Parses a plain decimal quantity (`3`, `2.5`, `.75`) into thousandths using integer
+/// arithmetic only. Anything not exactly representable (more than three decimals), zero,
+/// negative, or above [`MAX_QUANTITY_MILLI`] is rejected rather than rounded.
+fn parse_quantity_milli(raw: &str) -> Option<i64> {
+    let (whole, frac) = raw.split_once('.').unwrap_or((raw, ""));
+    if whole.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if whole.len() > 9 || frac.len() > 3 {
+        return None;
+    }
+    let w: i64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let mut f: i64 = if frac.is_empty() { 0 } else { frac.parse().ok()? };
+    for _ in frac.len()..3 {
+        f *= 10;
+    }
+    let milli = w.checked_mul(1000)?.checked_add(f)?;
+    (1..=MAX_QUANTITY_MILLI).contains(&milli).then_some(milli)
+}
+
+/// Splits `5kg` / `1.5L` / `12pcs` into (`5`, `kg`). The unit must be letters only.
+fn split_number_unit(token: &str) -> Option<(&str, &str)> {
+    let idx = token.find(|c: char| c.is_ascii_alphabetic())?;
+    let (num, unit) = token.split_at(idx);
+    let unit = unit.trim_end_matches('.');
+    if num.is_empty() || unit.is_empty() || !unit.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some((num, unit))
+}
+
+/// What the quantity position of an invoice line turned out to say.
+struct QuantityReading {
+    milli: i64,
+    certain: bool,
+    pack_size: Option<String>,
+    note: Option<String>,
+}
+
+impl QuantityReading {
+    fn certain(milli: i64) -> Self {
+        Self {
+            milli,
+            certain: true,
+            pack_size: None,
+            note: None,
+        }
+    }
+
+    /// A pack/unit was seen but the billed quantity was not stated: suggest one pack.
+    fn pack_only(pack: String) -> Self {
+        let note = format!(
+            "\"{pack}\" looks like a pack size, so the billed quantity was not found. Check the bill and enter the number of packs."
+        );
+        Self {
+            milli: 1000,
+            certain: false,
+            pack_size: Some(pack),
+            note: Some(note),
+        }
+    }
+
+    /// A number such as `100.00` sits where the quantity should be.
+    fn amount_like(milli: i64, raw: &str) -> Self {
+        Self {
+            milli,
+            certain: false,
+            pack_size: None,
+            note: Some(format!(
+                "\"{raw}\" looks like an amount, not a quantity (the line may have extra price columns). Check the bill."
+            )),
+        }
+    }
+
+    /// `2 x 1kg`: a count and a pack, but the text does not say whether the price is per
+    /// pack or for the line, so a person must confirm.
+    fn multiplier(count_milli: i64, pack: String) -> Self {
+        let note = format!(
+            "Read as {} x \"{pack}\". Confirm the number of packs and that the price is per pack.",
+            fmt_milli(count_milli)
+        );
+        Self {
+            milli: count_milli,
+            certain: false,
+            pack_size: Some(pack),
+            note: Some(note),
+        }
+    }
+}
+
+fn fmt_milli(milli: i64) -> String {
+    if milli % 1000 == 0 {
+        (milli / 1000).to_string()
+    } else {
+        format!("{}.{:03}", milli / 1000, milli % 1000)
+            .trim_end_matches('0')
+            .to_string()
+    }
+}
+
+/// Interprets the words just before the price, returning the reading and how many words
+/// it used. Only an explicitly labelled quantity, a bare number in the quantity column, or
+/// a count unit (`12 pcs`) is *certain*; weight/volume packs and multiplier forms are not.
+fn read_quantity(rest: &[&str]) -> Option<(QuantityReading, usize)> {
+    let n = rest.len();
+    let last = *rest.last()?;
+    let prev = if n >= 2 { Some(rest[n - 2]) } else { None };
+
+    // `Qty 3`, `Qty: 3`, `Quantity 3`
+    if let Some(p) = prev {
+        let p = p.to_ascii_lowercase();
+        if matches!(p.trim_end_matches([':', '.']), "qty" | "quantity") {
+            if let Some(q) = parse_quantity_milli(last) {
+                return Some((QuantityReading::certain(q), 2));
+            }
+        }
+    }
+    // `Qty:3`
+    let lower_last = last.to_ascii_lowercase();
+    if let Some(after) = lower_last.strip_prefix("qty") {
+        if let Some(q) = parse_quantity_milli(after.trim_start_matches([':', '.', '-', '='])) {
+            return Some((QuantityReading::certain(q), 1));
+        }
+    }
+
+    // `2 x 1kg` / `2 X 500ml`
+    if n >= 3 && matches!(rest[n - 2], "x" | "X" | "\u{d7}") {
+        if let (Some(count), Some((_, unit))) =
+            (parse_quantity_milli(rest[n - 3]), split_number_unit(last))
+        {
+            if classify_unit(unit).is_some() {
+                return Some((QuantityReading::multiplier(count, last.to_string()), 3));
+            }
+        }
+    }
+    // `2x1kg`
+    if let Some(pos) = last.find(['x', 'X', '\u{d7}']) {
+        let (left, right) = last.split_at(pos);
+        let right = &right[last[pos..].chars().next().map_or(1, char::len_utf8)..];
+        if let (Some(count), Some((_, unit))) =
+            (parse_quantity_milli(left), split_number_unit(right))
+        {
+            if classify_unit(unit).is_some() {
+                return Some((QuantityReading::multiplier(count, right.to_string()), 1));
+            }
+        }
+    }
+
+    // `12 pcs` / `5 kg`: number and unit as two words
+    if let Some(p) = prev {
+        if last.bytes().all(|b| b.is_ascii_alphabetic() || b == b'.') {
+            if let (Some(q), Some(kind)) = (
+                parse_quantity_milli(p),
+                classify_unit(last.trim_end_matches('.')),
+            ) {
+                return Some(match kind {
+                    UnitKind::Count => (QuantityReading::certain(q), 2),
+                    UnitKind::Measure => {
+                        (QuantityReading::pack_only(format!("{p}{}", last.trim_end_matches('.'))), 2)
+                    }
+                });
+            }
+        }
+    }
+
+    // `12pcs` / `5kg` / `1L`: number glued to a unit
+    if let Some((num, unit)) = split_number_unit(last) {
+        if let (Some(q), Some(kind)) = (parse_quantity_milli(num), classify_unit(unit)) {
+            return Some(match kind {
+                UnitKind::Count => (QuantityReading::certain(q), 1),
+                UnitKind::Measure => (QuantityReading::pack_only(last.to_string()), 1),
+            });
+        }
+        return None;
+    }
+
+    // A bare number in the quantity column. Exactly two decimals (`100.00`) reads like
+    // an amount, which happens when the line carries extra price columns (rate and line
+    // total), so that is not trusted as a quantity.
+    let q = parse_quantity_milli(last)?;
+    let looks_like_amount = last.split_once('.').is_some_and(|(_, frac)| frac.len() == 2);
+    if looks_like_amount {
+        Some((QuantityReading::amount_like(q, last), 1))
+    } else {
+        Some((QuantityReading::certain(q), 1))
+    }
+}
+
+/// Lines that summarise the bill rather than list a product.
+fn is_summary_line(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["total", "discount", "round", "balance", "cgst", "sgst", "igst"]
+        .iter()
+        .any(|k| lower.contains(k))
+}
+
+/// Parses one OCR line of the form `<name> <quantity section> <unit price> [<gst>%]`.
+/// Returns `None` for anything that does not fit; never guesses a quantity it cannot read.
+fn parse_item_line(text: &str, confidence: f32) -> Option<ParsedBillItem> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 3 {
+        return None;
+    }
+
+    // Optional trailing tax rate such as `5%`.
+    let (gst_rate_bps, body) = if words.last()?.ends_with('%') {
+        if words.len() < 4 {
+            return None;
+        }
+        (
+            parse_gst_rate_bps(words[words.len() - 1]).unwrap_or(0),
+            &words[..words.len() - 1],
+        )
+    } else {
+        (0, &words[..])
+    };
+
+    let price_paise = parse_amount_to_paise(body.last()?)?;
+    if price_paise <= 0 || price_paise > MAX_ITEM_PRICE_PAISE {
+        return None;
+    }
+    let rest = &body[..body.len() - 1];
+
+    let (reading, used) = read_quantity(rest)?;
+    let name = rest[..rest.len() - used].join(" ");
+    if name.is_empty() || is_summary_line(&name) {
+        return None;
+    }
+
+    Some(ParsedBillItem {
+        product_name_snapshot: name,
+        quantity_milli: reading.milli,
+        quantity_certain: reading.certain,
+        pack_size: reading.pack_size,
+        quantity_note: reading.note,
+        price_paise,
+        gst_rate_bps,
+        confidence,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,8 +354,34 @@ pub struct ParsedBill {
     pub average_confidence: f32,
 }
 
+/// Earliest and latest year accepted for an invoice date. Wide enough for any real bill,
+/// narrow enough to reject OCR noise such as `00/00/0000` or `12/10/9026`.
+const MIN_INVOICE_YEAR: u32 = 1990;
+const MAX_INVOICE_YEAR: u32 = 2100;
+
+/// True for a real calendar date (month lengths and leap years respected) in the
+/// accepted year range.
+pub fn is_valid_calendar_date(y: u32, m: u32, d: u32) -> bool {
+    if !(MIN_INVOICE_YEAR..=MAX_INVOICE_YEAR).contains(&y) || !(1..=12).contains(&m) {
+        return false;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days_in_month = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+    };
+    (1..=days_in_month).contains(&d)
+}
+
 /// Normalizes an Indian date string (`DD/MM/YYYY`, `DD-MM-YYYY`, `YYYY-MM-DD`)
-/// to ISO-8601 `YYYY-MM-DD`.
+/// to ISO-8601 `YYYY-MM-DD`. Impossible dates (31 February, month 13, ...) yield `None`.
 pub fn normalize_date(raw: &str) -> Option<String> {
     let clean = raw.trim();
     let parts: Vec<&str> = clean.split(['/', '-', '.']).collect();
@@ -69,7 +395,7 @@ pub fn normalize_date(raw: &str) -> Option<String> {
         let y: u32 = parts[0].parse().ok()?;
         let m: u32 = parts[1].parse().ok()?;
         let d: u32 = parts[2].parse().ok()?;
-        if (1..=12).contains(&m) && (1..=31).contains(&d) {
+        if is_valid_calendar_date(y, m, d) {
             return Some(format!("{y:04}-{m:02}-{d:02}"));
         }
     }
@@ -80,7 +406,7 @@ pub fn normalize_date(raw: &str) -> Option<String> {
         let d: u32 = parts[0].parse().ok()?;
         let m: u32 = parts[1].parse().ok()?;
         let y: u32 = parts[2].parse().ok()?;
-        if (1..=12).contains(&m) && (1..=31).contains(&d) {
+        if is_valid_calendar_date(y, m, d) {
             return Some(format!("{y:04}-{m:02}-{d:02}"));
         }
     }
@@ -266,47 +592,8 @@ pub fn parse_bill_tokens(tokens: &[OcrToken]) -> ParsedBill {
     let mut items = Vec::new();
 
     for token in tokens {
-        let text = token.text.trim();
-        let words: Vec<&str> = text.split_whitespace().collect();
-        if words.len() >= 3 {
-            // Check if last word is a tax rate (e.g. "5%", "18%", "0%")
-            let (gst_rate_bps, price_str, qty_str, name_words) =
-                if words.last().unwrap().ends_with('%') {
-                    if words.len() >= 4 {
-                        let gst = parse_gst_rate_bps(words[words.len() - 1]).unwrap_or(0);
-                        let price = words[words.len() - 2];
-                        let qty = words[words.len() - 3];
-                        let name = &words[..words.len() - 3];
-                        (gst, price, qty, name)
-                    } else {
-                        continue;
-                    }
-                } else {
-                    let price = words[words.len() - 1];
-                    let qty = words[words.len() - 2];
-                    let name = &words[..words.len() - 2];
-                    (0, price, qty, name)
-                };
-
-            if let Some(price_paise) = parse_amount_to_paise(price_str) {
-                // Parse quantity (clean out units like kg, ltr, pcs, etc.)
-                let cleaned_qty: String = qty_str
-                    .chars()
-                    .filter(|&c| c.is_ascii_digit() || c == '.')
-                    .collect();
-                if let Ok(qty_f) = cleaned_qty.parse::<f64>() {
-                    let name = name_words.join(" ");
-                    if !name.is_empty() && price_paise > 0 && qty_f > 0.0 {
-                        items.push(ParsedBillItem {
-                            product_name_snapshot: name,
-                            quantity_milli: (qty_f * 1000.0).round() as i64,
-                            price_paise,
-                            gst_rate_bps,
-                            confidence: token.confidence,
-                        });
-                    }
-                }
-            }
+        if let Some(item) = parse_item_line(token.text.trim(), token.confidence) {
+            items.push(item);
         }
     }
 
@@ -372,63 +659,143 @@ pub fn fixture_tokens() -> Vec<OcrToken> {
     ]
 }
 
+/// Most tokens accepted from one engine run. A busy invoice is a few hundred.
+const MAX_ENGINE_TOKENS: usize = 5_000;
+/// Longest text kept for a single token; longer text is cut, not rejected.
+const MAX_TOKEN_CHARS: usize = 500;
+
+/// Normalises untrusted engine output before it is parsed or stored: bounded token count,
+/// bounded text, no control characters, finite confidence in `0.0..=1.0`, sane boxes.
+fn sanitize_tokens(raw: Vec<OcrToken>) -> Result<Vec<OcrToken>, ApiError> {
+    if raw.len() > MAX_ENGINE_TOKENS {
+        tracing::warn!(tokens = raw.len(), "OCR engine returned too many tokens");
+        return Err(ApiError::BadRequest(
+            "The OCR engine returned more text than expected. You can enter the bill details manually."
+                .into(),
+        ));
+    }
+    Ok(raw
+        .into_iter()
+        .map(|t| OcrToken {
+            text: t
+                .text
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .take(MAX_TOKEN_CHARS)
+                .collect(),
+            confidence: if t.confidence.is_finite() {
+                t.confidence.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            box_points: t
+                .box_points
+                .filter(|b| b.iter().flatten().all(|v| v.is_finite())),
+        })
+        .collect())
+}
+
 fn truncate_for_log(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
+}
+
+/// How OCR should run, derived from the server configuration.
+#[derive(Debug, Clone)]
+pub struct OcrSettings {
+    /// Executable run as `<cmd> <image-path>` (`ARTHA_PADDLE_OCR_CMD`).
+    pub cmd: Option<String>,
+    pub environment: Environment,
+    /// Raw `ARTHA_OCR_USE_DEV_FIXTURES` flag; only honoured in development.
+    pub use_dev_fixtures: bool,
+    pub timeout: Duration,
+    /// Limits how many engine processes may run at once (`ARTHA_OCR_MAX_CONCURRENCY`).
+    pub permits: Arc<Semaphore>,
+}
+
+impl OcrSettings {
+    /// Fixtures are served only when explicitly requested *and* the typed
+    /// environment is `Development`. Production ignores the flag.
+    pub fn dev_fixtures_allowed(&self) -> bool {
+        self.environment.is_development() && self.use_dev_fixtures
+    }
 }
 
 /// Executes OCR processing on an image file.
 ///
 /// Priority & Subprocess Management:
-/// 1. If an external OCR command (`cmd_opt`) is provided, spawns that child process using
-///    Tokio's async process API with `kill_on_drop(true)` and bounds execution by `timeout_duration`.
-///    On timeout the future is dropped, which kills the *direct* child only. Processes that
-///    child itself started (for example the Python interpreter behind a wrapper script) are
-///    NOT killed and keep running until they exit on their own. Killing the whole process
-///    tree needs platform-specific code (process groups on Unix, a Job Object on Windows).
-/// 2. If no command is configured:
-///    - In Production (`Environment::Production`): Fails with an actionable `ApiError::BadRequest`
-///      indicating that local OCR is not configured and advising manual entry. It NEVER returns
-///      dummy fixture data in production.
-///    - In Development / Tests (`Environment::Development`): Returns deterministic fixture
-///      tokens for testing and offline local development.
+/// 1. If an external OCR command is configured, it runs through [`runner::run_engine`]: at
+///    most `settings.permits` engines at once, one wall-clock budget (`settings.timeout`),
+///    bounded stdout/stderr, and the whole process tree (not just the direct child) killed
+///    on timeout, oversize output, or request cancellation.
+/// 2. If no command is configured, the request fails with an actionable error asking the
+///    user to enter the bill by hand, **unless** canned fixtures were explicitly enabled
+///    (`ARTHA_OCR_USE_DEV_FIXTURES`) in a development environment. Fixtures are never
+///    served by default and never in production.
 pub async fn execute_ocr(
     image_path: &Path,
-    cmd_opt: Option<&str>,
-    environment: crate::config::Environment,
-    timeout_duration: std::time::Duration,
+    settings: &OcrSettings,
 ) -> Result<(OcrResultPayload, ParsedBill), ApiError> {
+    let cmd_opt = settings.cmd.as_deref();
+    let timeout_duration = settings.timeout;
     if !image_path.exists() {
         return Err(ApiError::NotFound("Image file not found on disk".into()));
     }
 
     if let Some(cmd) = cmd_opt {
-        let path_str = image_path.to_string_lossy().to_string();
-        let child = tokio::process::Command::new(cmd)
-            .arg(&path_str)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
+        // Bound how many engine processes run at once. The permit is released on every
+        // exit path (success, error, timeout, a dropped request, panic) when it drops.
+        // Waiting for a free slot shares the request's time budget.
+        let _permit = match tokio::time::timeout(
+            timeout_duration,
+            settings.permits.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => {
+                return Err(ApiError::Internal("OCR permit pool closed".into()));
+            }
+            Err(_) => {
+                return Err(ApiError::ServiceUnavailable(
+                    "The OCR engine is busy with other bills. Wait a moment and try again, or enter the bill details manually."
+                        .into(),
+                ));
+            }
+        };
+
+        let output = match runner::run_engine(cmd, image_path, timeout_duration).await {
+            Ok(out) => out,
+            Err(runner::RunError::Spawn(e)) => {
                 // Detail goes to the server log only: the command path and OS error
                 // would otherwise reveal the server's filesystem layout to API clients.
                 tracing::error!(command = %cmd, error = %e, "failed to start the configured OCR engine");
-                ApiError::BadRequest(
+                return Err(ApiError::BadRequest(
                     "Failed to start the configured OCR engine. Check that ARTHA_PADDLE_OCR_CMD points to an executable file, or enter the bill details manually."
                         .into(),
-                )
-            })?;
-
-        let output = match tokio::time::timeout(timeout_duration, child.wait_with_output()).await {
-            Ok(Ok(out)) => out,
-            Ok(Err(e)) => {
+                ));
+            }
+            Err(runner::RunError::Io(e)) => {
                 return Err(ApiError::Internal(format!("OCR process I/O error: {e}")));
             }
-            Err(_) => {
+            Err(runner::RunError::TimedOut) => {
+                tracing::warn!(
+                    timeout_secs = timeout_duration.as_secs(),
+                    "OCR engine timed out; its process tree was terminated"
+                );
                 return Err(ApiError::BadRequest(format!(
-                    "OCR processing timed out after {} seconds",
+                    "OCR processing timed out after {} seconds. You can enter the bill details manually.",
                     timeout_duration.as_secs()
                 )));
+            }
+            Err(runner::RunError::OutputTooLarge) => {
+                tracing::warn!(
+                    limit_bytes = runner::MAX_STDOUT_BYTES,
+                    "OCR engine produced too much output; its process tree was terminated"
+                );
+                return Err(ApiError::BadRequest(
+                    "The OCR engine returned more output than expected. You can enter the bill details manually."
+                        .into(),
+                ));
             }
         };
 
@@ -457,6 +824,7 @@ pub async fn execute_ocr(
             )
         })?;
 
+        let raw_tokens = sanitize_tokens(raw_tokens)?;
         let parsed = parse_bill_tokens(&raw_tokens);
         let payload = OcrResultPayload {
             engine_version: "paddleocr_cli_v1".to_string(),
@@ -466,14 +834,15 @@ pub async fn execute_ocr(
         return Ok((payload, parsed));
     }
 
-    // No OCR command configured:
-    if environment == crate::config::Environment::Production {
+    // No OCR command configured: only an explicit development opt-in may serve
+    // canned data. Anything else is an error that points the user at manual entry.
+    if !settings.dev_fixtures_allowed() {
         return Err(ApiError::BadRequest(
-            "Local OCR engine is not configured on this server (ARTHA_PADDLE_OCR_CMD is not set). Please configure an OCR command or enter bill details manually.".into(),
+            "Local OCR engine is not configured on this server (ARTHA_PADDLE_OCR_CMD is not set), so this bill cannot be read automatically. Enter the bill details manually, or ask the owner to configure an OCR engine.".into(),
         ));
     }
 
-    // Default built-in OCR processor for development & tests:
+    // Explicit development opt-in: canned sample data, clearly identified.
     let tokens = fixture_tokens();
     let parsed = parse_bill_tokens(&tokens);
     let payload = OcrResultPayload {
@@ -495,6 +864,21 @@ mod tests {
         assert_eq!(normalize_date("05-09-2025"), Some("2025-09-05".to_string()));
         assert_eq!(normalize_date("2026-11-23"), Some("2026-11-23".to_string()));
         assert_eq!(normalize_date("invalid-date"), None);
+    }
+
+    #[test]
+    fn impossible_calendar_dates_are_not_extracted() {
+        assert_eq!(normalize_date("31/02/2026"), None);
+        assert_eq!(normalize_date("30/02/2024"), None);
+        assert_eq!(normalize_date("29/02/2026"), None, "2026 is not a leap year");
+        assert_eq!(normalize_date("29/02/2028"), Some("2028-02-29".to_string()));
+        assert_eq!(normalize_date("31/04/2026"), None);
+        assert_eq!(normalize_date("00/10/2026"), None);
+        assert_eq!(normalize_date("12/13/2026"), None);
+        assert_eq!(normalize_date("12/10/9026"), None, "implausible year");
+        assert_eq!(normalize_date("12/10/1899"), None, "implausible year");
+        assert_eq!(normalize_date("2026-02-30"), None);
+        assert_eq!(normalize_date("29/02/1900"), None, "outside the accepted range");
     }
 
     #[test]
@@ -561,64 +945,223 @@ mod tests {
         assert_eq!(parsed.stated_total_paise, Some(64000));
         assert_eq!(parsed.items.len(), 2);
 
+        // "2kg" / "1L" are pack sizes, not billed quantities: one pack is suggested but
+        // flagged for review instead of being read as "2 units".
         assert_eq!(parsed.items[0].product_name_snapshot, "Organic Sugar");
-        assert_eq!(parsed.items[0].quantity_milli, 2000);
+        assert_eq!(parsed.items[0].quantity_milli, 1000);
+        assert!(!parsed.items[0].quantity_certain);
+        assert_eq!(parsed.items[0].pack_size.as_deref(), Some("2kg"));
         assert_eq!(parsed.items[0].price_paise, 9000);
         assert_eq!(parsed.items[0].gst_rate_bps, 500);
 
         assert_eq!(parsed.items[1].product_name_snapshot, "Pure Ghee");
         assert_eq!(parsed.items[1].quantity_milli, 1000);
+        assert!(!parsed.items[1].quantity_certain);
+        assert_eq!(parsed.items[1].pack_size.as_deref(), Some("1L"));
         assert_eq!(parsed.items[1].price_paise, 55000);
         assert_eq!(parsed.items[1].gst_rate_bps, 1200);
     }
 
-    #[tokio::test]
-    async fn test_execute_ocr_production_without_cmd_fails_clearly() {
-        let temp_dir = std::env::temp_dir();
-        let image_path = temp_dir.join(format!("test_img_prod_{}.png", std::process::id()));
-        std::fs::write(&image_path, b"test-image-content").unwrap();
+    // ---- quantity versus pack size ----------------------------------------------------
 
-        let result = execute_ocr(
-            &image_path,
-            None,
-            crate::config::Environment::Production,
-            std::time::Duration::from_secs(30),
-        )
-        .await;
+    fn item_for(line: &str) -> Option<ParsedBillItem> {
+        parse_item_line(line, 0.9)
+    }
 
-        let _ = std::fs::remove_file(&image_path);
-
-        match result {
-            Err(ApiError::BadRequest(msg)) => {
-                assert!(
-                    msg.contains("Local OCR engine is not configured on this server"),
-                    "Expected actionable error message, got: {msg}"
-                );
-            }
-            other => panic!("Expected ApiError::BadRequest, got: {other:?}"),
+    #[test]
+    fn pack_sizes_are_not_read_as_quantities() {
+        for (line, name, pack) in [
+            ("Basmati Rice 5kg 350.00 5%", "Basmati Rice", "5kg"),
+            ("Sunflower Oil 1L 140.00 5%", "Sunflower Oil", "1L"),
+            ("Wheat Flour 10kg 420.00 0%", "Wheat Flour", "10kg"),
+            ("Milk 500ml 30.00", "Milk", "500ml"),
+            ("Basmati Rice 5 kg 350.00 5%", "Basmati Rice", "5kg"),
+            ("Jeera 250g 80.00", "Jeera", "250g"),
+            ("Jeera 1.5kg 80.00", "Jeera", "1.5kg"),
+        ] {
+            let it = item_for(line).unwrap_or_else(|| panic!("{line:?} should parse"));
+            assert_eq!(it.product_name_snapshot, name, "{line}");
+            assert_eq!(it.quantity_milli, 1000, "{line}: placeholder is one pack");
+            assert!(!it.quantity_certain, "{line}: must require review");
+            assert_eq!(it.pack_size.as_deref(), Some(pack), "{line}");
+            assert!(it.quantity_note.as_deref().unwrap().contains("pack size"), "{line}");
         }
     }
 
-    #[tokio::test]
-    async fn test_execute_ocr_development_without_cmd_returns_fixtures() {
-        let temp_dir = std::env::temp_dir();
-        let image_path = temp_dir.join(format!("test_img_dev_{}.png", std::process::id()));
-        std::fs::write(&image_path, b"test-image-content").unwrap();
+    #[test]
+    fn explicit_quantities_are_certain() {
+        for (line, name, milli, price) in [
+            ("Soap 3 350.00 5%", "Soap", 3000, 35000),
+            ("Soap 3 350.00", "Soap", 3000, 35000),
+            ("Sugar Qty 3 90.00", "Sugar", 3000, 9000),
+            ("Sugar Qty: 3 90.00", "Sugar", 3000, 9000),
+            ("Sugar Qty:3 90.00", "Sugar", 3000, 9000),
+            ("Pen 12 pcs 10.00", "Pen", 12000, 1000),
+            ("Pen 12pcs 10.00", "Pen", 12000, 1000),
+            ("Pen 12 Nos. 10.00", "Pen", 12000, 1000),
+            ("Rice 5kg 2 350.00", "Rice 5kg", 2000, 35000),
+            ("Onion 2.5 40.00", "Onion", 2500, 4000),
+        ] {
+            let it = item_for(line).unwrap_or_else(|| panic!("{line:?} should parse"));
+            assert_eq!(it.product_name_snapshot, name, "{line}");
+            assert_eq!(it.quantity_milli, milli, "{line}");
+            assert_eq!(it.price_paise, price, "{line}");
+            assert!(it.quantity_certain, "{line}");
+            assert!(it.pack_size.is_none() && it.quantity_note.is_none(), "{line}");
+        }
+    }
 
+    #[test]
+    fn multiplier_forms_keep_the_count_but_need_review() {
+        for line in ["Sugar 2 x 1kg 90.00", "Sugar 2 X 1kg 90.00", "Sugar 2x1kg 90.00"] {
+            let it = item_for(line).unwrap_or_else(|| panic!("{line:?} should parse"));
+            assert_eq!(it.product_name_snapshot, "Sugar", "{line}");
+            assert_eq!(it.quantity_milli, 2000, "{line}");
+            assert!(!it.quantity_certain, "{line}: could be 2 packs or 1 pack of 2");
+            assert_eq!(it.pack_size.as_deref(), Some("1kg"), "{line}");
+        }
+    }
+
+    #[test]
+    fn amount_like_numbers_in_the_quantity_slot_are_not_trusted() {
+        // rate and line total both present: `100.00` is the rate, not a quantity.
+        let it = item_for("Soap 3 100.00 300.00").unwrap();
+        assert!(!it.quantity_certain);
+        assert!(it.quantity_note.as_deref().unwrap().contains("amount"));
+    }
+
+    #[test]
+    fn lines_without_a_readable_quantity_or_name_are_skipped_not_guessed() {
+        assert!(item_for("3 350.00 5%").is_none(), "no product name");
+        assert!(item_for("Rice Flour 90.00").is_none(), "no quantity");
+        assert!(item_for("Grand Total: 910.00").is_none());
+        assert!(item_for("Total Qty 5 910.00").is_none(), "summary line");
+        assert!(item_for("Round Off 1 0.40").is_none(), "summary line");
+        assert!(item_for("Rice 0 350.00").is_none(), "zero quantity");
+        assert!(item_for("Rice 5 0.00").is_none(), "zero price");
+        assert!(item_for("Rice 10A 350.00").is_none(), "unknown unit");
+        assert!(item_for("Rice 2.5555 350.00").is_none(), "unrepresentable decimals");
+    }
+
+    #[test]
+    fn hostile_quantities_never_overflow_or_become_floats() {
+        for line in [
+            "Rice 99999999999999999999 350.00",
+            "Rice 1000001 350.00",
+            "Rice 9999999999 350.00",
+            "Rice 1e9 350.00",
+            "Rice -3 350.00",
+            "Rice 3 99999999999999999.99",
+            "Rice 5 999999999999.00",
+        ] {
+            assert!(item_for(line).is_none(), "{line:?} must be rejected");
+        }
+        // The largest accepted values still produce exact integer milli-units.
+        let it = item_for("Rice 1000000 1.00").unwrap();
+        assert_eq!(it.quantity_milli, 1_000_000_000);
+        let it = item_for("Rice 0.001 1.00").unwrap();
+        assert_eq!(it.quantity_milli, 1);
+    }
+
+    #[test]
+    fn fixture_bill_marks_every_pack_line_for_review() {
+        let parsed = parse_bill_tokens(&fixture_tokens());
+        assert_eq!(parsed.items.len(), 3);
+        assert!(parsed.items.iter().all(|i| !i.quantity_certain));
+        assert!(parsed.items.iter().all(|i| i.quantity_milli == 1000));
+    }
+
+    fn settings(
+        cmd: Option<&str>,
+        environment: Environment,
+        use_dev_fixtures: bool,
+        timeout: Duration,
+    ) -> OcrSettings {
+        settings_with_permits(
+            cmd,
+            environment,
+            use_dev_fixtures,
+            timeout,
+            Arc::new(Semaphore::new(2)),
+        )
+    }
+
+    fn settings_with_permits(
+        cmd: Option<&str>,
+        environment: Environment,
+        use_dev_fixtures: bool,
+        timeout: Duration,
+        permits: Arc<Semaphore>,
+    ) -> OcrSettings {
+        OcrSettings {
+            cmd: cmd.map(str::to_string),
+            environment,
+            use_dev_fixtures,
+            timeout,
+            permits,
+        }
+    }
+
+    fn temp_image(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("artha_ocr_{tag}_{}.png", std::process::id()));
+        std::fs::write(&p, b"test-image-content").unwrap();
+        p
+    }
+
+    /// Every environment x fixture-flag combination with no OCR engine configured.
+    /// Only (development, flag on) may return data, and that data is labelled.
+    #[tokio::test]
+    async fn fixtures_are_served_only_for_development_with_the_explicit_flag() {
+        let image = temp_image("matrix");
+        for (env, flag) in [
+            (Environment::Development, false),
+            (Environment::Production, false),
+            (Environment::Production, true),
+            (Environment::Development, true),
+        ] {
+            let result =
+                execute_ocr(&image, &settings(None, env, flag, Duration::from_secs(5))).await;
+            if env == Environment::Development && flag {
+                let (payload, parsed) = result.expect("explicit dev opt-in serves fixtures");
+                assert_eq!(payload.engine_version, DEV_FIXTURE_ENGINE_VERSION);
+                assert_eq!(parsed.invoice_no, Some("INV-2026-089".to_string()));
+                assert_eq!(parsed.items.len(), 3);
+            } else {
+                match result {
+                    Err(ApiError::BadRequest(msg)) => {
+                        assert!(
+                            msg.contains("Local OCR engine is not configured on this server"),
+                            "{env:?}/{flag}: {msg}"
+                        );
+                        assert!(msg.contains("manually"), "{env:?}/{flag}: {msg}");
+                    }
+                    other => panic!("{env:?}/{flag}: expected BadRequest, got {other:?}"),
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&image);
+    }
+
+    #[tokio::test]
+    async fn a_configured_engine_is_used_even_when_the_fixture_flag_is_on() {
+        // The flag only decides what happens when there is no engine. With an engine
+        // configured, a failure must surface as an error, never as fixture data.
+        let image = temp_image("engine_over_flag");
         let result = execute_ocr(
-            &image_path,
-            None,
-            crate::config::Environment::Development,
-            std::time::Duration::from_secs(30),
+            &image,
+            &settings(
+                Some("/definitely/missing/dir/ocr-engine"),
+                Environment::Development,
+                true,
+                Duration::from_secs(5),
+            ),
         )
         .await;
-
-        let _ = std::fs::remove_file(&image_path);
-
-        let (payload, parsed) = result.expect("Dev mode should succeed with fixtures");
-        assert_eq!(payload.engine_version, "artha_ocr_dev_fixture_v1");
-        assert_eq!(parsed.invoice_no, Some("INV-2026-089".to_string()));
-        assert_eq!(parsed.items.len(), 3);
+        let _ = std::fs::remove_file(&image);
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(ref m)) if m.contains("Failed to start")),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -626,9 +1169,12 @@ mod tests {
         let nonexistent = Path::new("nonexistent_artha_test_image.png");
         let result = execute_ocr(
             nonexistent,
-            None,
-            crate::config::Environment::Development,
-            std::time::Duration::from_secs(30),
+            &settings(
+                None,
+                Environment::Development,
+                true,
+                Duration::from_secs(30),
+            ),
         )
         .await;
 
@@ -662,9 +1208,12 @@ mod tests {
 
         let result = execute_ocr(
             &image_path,
-            Some(&cmd),
-            crate::config::Environment::Development,
-            std::time::Duration::from_millis(150),
+            &settings(
+                Some(&cmd),
+                Environment::Development,
+                false,
+                Duration::from_millis(150),
+            ),
         )
         .await;
 
@@ -768,9 +1317,12 @@ mod tests {
         let script = write_script(tag, windows_body, unix_body);
         let result = execute_ocr(
             &image,
-            Some(&script.to_string_lossy()),
-            crate::config::Environment::Development,
-            std::time::Duration::from_secs(20),
+            &settings(
+                Some(&script.to_string_lossy()),
+                Environment::Development,
+                false,
+                Duration::from_secs(20),
+            ),
         )
         .await;
         let _ = std::fs::remove_file(&image);
@@ -785,9 +1337,12 @@ mod tests {
         std::fs::write(&image, b"test-image-content").unwrap();
         let result = execute_ocr(
             &image,
-            Some("/definitely/missing/dir/ocr-engine"),
-            crate::config::Environment::Development,
-            std::time::Duration::from_secs(5),
+            &settings(
+                Some("/definitely/missing/dir/ocr-engine"),
+                Environment::Development,
+                false,
+                Duration::from_secs(5),
+            ),
         )
         .await;
         let _ = std::fs::remove_file(&image);
@@ -852,5 +1407,268 @@ mod tests {
         assert_eq!(payload.engine_version, "paddleocr_cli_v1");
         assert_ne!(payload.engine_version, DEV_FIXTURE_ENGINE_VERSION);
         assert!(parsed.items.is_empty());
+    }
+
+    #[test]
+    fn engine_tokens_are_bounded_and_normalised() {
+        let long = "a".repeat(MAX_TOKEN_CHARS * 3);
+        let out = sanitize_tokens(vec![
+            OcrToken {
+                text: "Bill\u{0}No:\u{7}\n1".to_string(),
+                confidence: 7.5,
+                box_points: None,
+            },
+            OcrToken {
+                text: long,
+                confidence: -2.0,
+                box_points: Some([[0.0, 0.0], [f32::INFINITY, 0.0], [1.0, 1.0], [0.0, 1.0]]),
+            },
+            OcrToken {
+                text: "x".to_string(),
+                confidence: f32::NAN,
+                box_points: Some([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]),
+            },
+        ])
+        .unwrap();
+        assert_eq!(out[0].text, "Bill No:  1");
+        assert_eq!(out[0].confidence, 1.0);
+        assert_eq!(out[1].text.chars().count(), MAX_TOKEN_CHARS);
+        assert_eq!(out[1].confidence, 0.0);
+        assert!(out[1].box_points.is_none(), "non-finite box dropped");
+        assert_eq!(out[2].confidence, 0.0);
+        assert!(out[2].box_points.is_some());
+
+        let too_many = vec![tok("x"); MAX_ENGINE_TOKENS + 1];
+        assert!(matches!(
+            sanitize_tokens(too_many),
+            Err(ApiError::BadRequest(ref m)) if m.contains("more text than expected")
+        ));
+    }
+
+    #[tokio::test]
+    async fn engine_output_with_invalid_utf8_or_wrong_shape_is_rejected_generically() {
+        // 0xFF 0xFE is not valid UTF-8 inside a JSON string.
+        let bad_utf8 = script_path(
+            "utf8",
+            "@echo off\r\necho [{\"text\":\"\u{fffd}\"}]\r\n",
+            "#!/bin/sh\nprintf '[{\"text\":\"\\377\\376\",\"confidence\":0.9}]'\n",
+        );
+        let permits = Arc::new(Semaphore::new(1));
+        // On Unix the bytes are genuinely invalid; on Windows the shape is wrong (no
+        // confidence). Either way the result is a generic, safe rejection.
+        match run_with(&bad_utf8, permits.clone(), Duration::from_secs(20)).await {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("could not be read"), "{msg}");
+                assert!(!msg.contains("utf"), "parser internals leaked: {msg}");
+            }
+            other => panic!("Expected a generic BadRequest, got: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&bad_utf8);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    // ---- concurrency, permit release, and output bounds -------------------------------
+
+    fn script_path(tag: &str, windows_body: &str, unix_body: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        // `write_script` names files by tag + pid, so make the tag unique per call.
+        write_script(&format!("{tag}{n}"), windows_body, unix_body)
+    }
+
+    async fn run_with(
+        script: &Path,
+        permits: Arc<Semaphore>,
+        timeout: Duration,
+    ) -> Result<(OcrResultPayload, ParsedBill), ApiError> {
+        let image = temp_image(&format!(
+            "perm{}",
+            script.file_stem().unwrap().to_string_lossy()
+        ));
+        let result = execute_ocr(
+            &image,
+            &settings_with_permits(
+                Some(&script.to_string_lossy()),
+                Environment::Development,
+                false,
+                timeout,
+                permits,
+            ),
+        )
+        .await;
+        let _ = std::fs::remove_file(&image);
+        result
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_never_run_more_engines_than_the_limit() {
+        let log = std::env::temp_dir().join(format!("artha_ocr_conc_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let l = log.display();
+        let script = script_path(
+            "conc",
+            &format!(
+                "@echo off\r\necho start>>\"{l}\"\r\nping -n 2 127.0.0.1 >nul\r\necho end>>\"{l}\"\r\necho []\r\n"
+            ),
+            &format!("#!/bin/sh\necho start >> '{l}'\nsleep 0.3\necho end >> '{l}'\necho '[]'\n"),
+        );
+        let permits = Arc::new(Semaphore::new(1));
+        let timeout = Duration::from_secs(60);
+        let (a, b, c) = tokio::join!(
+            run_with(&script, permits.clone(), timeout),
+            run_with(&script, permits.clone(), timeout),
+            run_with(&script, permits.clone(), timeout),
+        );
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+
+        // With one permit the runs are strictly sequential: start,end,start,end,...
+        let lines: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|s| s.trim().to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            ["start", "end", "start", "end", "start", "end"],
+            "engines overlapped despite a limit of 1"
+        );
+        assert_eq!(permits.available_permits(), 1);
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(&script);
+    }
+
+    #[tokio::test]
+    async fn a_request_waiting_for_a_busy_slot_gets_a_retryable_error() {
+        let hang = script_path(
+            "busy",
+            "@echo off\r\nping -n 60 127.0.0.1 >nul\r\n",
+            "#!/bin/sh\nsleep 30\n",
+        );
+        let permits = Arc::new(Semaphore::new(1));
+
+        let holder = {
+            let (hang, permits) = (hang.clone(), permits.clone());
+            tokio::spawn(async move { run_with(&hang, permits, Duration::from_secs(4)).await })
+        };
+        for _ in 0..100 {
+            if permits.available_permits() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the first engine should hold the slot"
+        );
+
+        let second = run_with(&hang, permits.clone(), Duration::from_millis(300)).await;
+        assert!(
+            matches!(second, Err(ApiError::ServiceUnavailable(ref m)) if m.contains("busy")),
+            "{second:?}"
+        );
+
+        // The holder times out, which must free its slot again.
+        let first = holder.await.unwrap();
+        assert!(
+            matches!(first, Err(ApiError::BadRequest(ref m)) if m.contains("timed out")),
+            "{first:?}"
+        );
+        assert_eq!(permits.available_permits(), 1);
+        let _ = std::fs::remove_file(&hang);
+    }
+
+    #[tokio::test]
+    async fn the_slot_is_released_after_every_kind_of_outcome() {
+        let permits = Arc::new(Semaphore::new(1));
+        let ok = script_path("rel_ok", "@echo []\r\n", "#!/bin/sh\necho '[]'\n");
+        let exit3 = script_path("rel_exit", "@exit /b 3\r\n", "#!/bin/sh\nexit 3\n");
+        let junk = script_path(
+            "rel_junk",
+            "@echo not-json\r\n",
+            "#!/bin/sh\necho not-json\n",
+        );
+        let hang = script_path(
+            "rel_hang",
+            "@echo off\r\nping -n 60 127.0.0.1 >nul\r\n",
+            "#!/bin/sh\nsleep 30\n",
+        );
+
+        assert!(run_with(&ok, permits.clone(), Duration::from_secs(20))
+            .await
+            .is_ok());
+        assert_eq!(permits.available_permits(), 1, "after success");
+        assert!(run_with(&exit3, permits.clone(), Duration::from_secs(20))
+            .await
+            .is_err());
+        assert_eq!(permits.available_permits(), 1, "after a non-zero exit");
+        assert!(run_with(&junk, permits.clone(), Duration::from_secs(20))
+            .await
+            .is_err());
+        assert_eq!(permits.available_permits(), 1, "after unreadable output");
+        assert!(run_with(&hang, permits.clone(), Duration::from_millis(300))
+            .await
+            .is_err());
+        assert_eq!(permits.available_permits(), 1, "after a timeout");
+
+        for p in [ok, exit3, junk, hang] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_slot_is_released_when_the_request_is_dropped() {
+        let hang = script_path(
+            "drop",
+            "@echo off\r\nping -n 60 127.0.0.1 >nul\r\n",
+            "#!/bin/sh\nsleep 30\n",
+        );
+        let permits = Arc::new(Semaphore::new(1));
+        let task = {
+            let (hang, permits) = (hang.clone(), permits.clone());
+            tokio::spawn(async move { run_with(&hang, permits, Duration::from_secs(120)).await })
+        };
+        for _ in 0..100 {
+            if permits.available_permits() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(permits.available_permits(), 0);
+
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            permits.available_permits(),
+            1,
+            "a dropped request must free its slot"
+        );
+        let _ = std::fs::remove_file(&hang);
+    }
+
+    #[tokio::test]
+    async fn runaway_engine_output_gets_a_generic_error_and_frees_the_slot() {
+        let permits = Arc::new(Semaphore::new(1));
+        let flood = script_path(
+            "flood",
+            "@echo off\r\nfor /l %%i in (1,1,200000) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\nping -n 60 127.0.0.1 >nul\r\n",
+            "#!/bin/sh\nyes | head -c 8000000\nsleep 30\n",
+        );
+        let result = run_with(&flood, permits.clone(), Duration::from_secs(60)).await;
+        match result {
+            Err(ApiError::BadRequest(msg)) => {
+                assert!(msg.contains("more output than expected"), "{msg}");
+                assert!(
+                    !msg.contains(&*flood.to_string_lossy()),
+                    "path leaked: {msg}"
+                );
+            }
+            other => panic!("Expected ApiError::BadRequest, got: {other:?}"),
+        }
+        assert_eq!(permits.available_permits(), 1);
+        let _ = std::fs::remove_file(&flood);
     }
 }

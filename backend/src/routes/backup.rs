@@ -51,6 +51,27 @@ pub struct BackupView {
     pub checksum_sha256: String,
     pub created_at: String,
     pub size_bytes: u64,
+    /// True when this backup carries its bill photos (an `*.images.json` manifest exists).
+    /// Backups made before photos were included are database-only (`false`).
+    pub images_included: bool,
+    /// Bill photos stored with this backup.
+    pub image_count: usize,
+    /// Bill photos the database refers to that could not be stored (file missing or
+    /// damaged at backup time). Non-zero deserves attention; never hidden.
+    pub images_missing: usize,
+}
+
+impl BackupView {
+    /// Fills the photo fields from the backup's manifest, if it has one.
+    fn with_image_info(mut self) -> Self {
+        let db_path = Path::new(&self.path);
+        self.images_included = crate::bill_images::has_manifest(db_path);
+        if let Some(c) = crate::bill_images::manifest_counts(db_path) {
+            self.image_count = c.stored;
+            self.images_missing = c.missing;
+        }
+        self
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,13 +145,34 @@ fn create_backup_preserving(
     let app_version = env!("CARGO_PKG_VERSION").to_string();
     let path = dest_path.to_string_lossy().into_owned();
 
+    // Copy the bill photos this snapshot refers to, then register the backup. If either
+    // step fails the half-made backup files are removed and no row is written, so a
+    // backup either exists completely (database + photo manifest) or not at all.
+    // Photos already in the shared store are never touched or deleted here.
+    let image_counts = match crate::bill_images::snapshot_images(
+        &state.upload_dir,
+        &dest_path,
+        &backup_id,
+        &checksum_sha256,
+    ) {
+        Ok(counts) => counts,
+        Err(e) => {
+            remove_backup_files(&dest_path);
+            return Err(e);
+        }
+    };
+
     {
         let conn = state.db.lock().expect("db mutex poisoned");
-        conn.execute(
+        if let Err(e) = conn.execute(
             "INSERT INTO backups (backup_id, app_version, schema_version, path, checksum_sha256, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![backup_id, app_version, schema_version, path, checksum_sha256, now],
-        )?;
+        ) {
+            drop(conn);
+            remove_backup_files(&dest_path);
+            return Err(e.into());
+        }
     }
 
     prune_old_backups(state, preserve_ids)?;
@@ -143,7 +185,17 @@ fn create_backup_preserving(
         checksum_sha256,
         created_at: now,
         size_bytes,
+        images_included: true,
+        image_count: image_counts.stored,
+        images_missing: image_counts.missing,
     })
+}
+
+/// Removes a backup's own files (database copy and photo manifest). Never touches the
+/// shared photo store, which other backups may rely on.
+fn remove_backup_files(db_backup_path: &Path) {
+    let _ = std::fs::remove_file(db_backup_path);
+    let _ = std::fs::remove_file(crate::bill_images::manifest_path_for(db_backup_path));
 }
 
 /// Keeps the most recent `backup_retention` non-preserved backups (by
@@ -176,7 +228,8 @@ fn prune_old_backups(state: &AppState, preserve_ids: &[&str]) -> Result<(), ApiE
         // Best-effort file removal; the database row is the source of truth
         // for what "exists" means, so a stray orphaned file on disk is a
         // harmless leftover rather than a correctness problem.
-        let _ = std::fs::remove_file(&path);
+        // The backup's own manifest goes with it; the shared photo store is never pruned.
+        remove_backup_files(Path::new(&path));
         conn.execute(
             "DELETE FROM backups WHERE backup_id = ?1",
             rusqlite::params![backup_id],
@@ -209,6 +262,9 @@ fn snapshot_all_backup_rows(state: &AppState) -> Result<Vec<BackupView>, ApiErro
             checksum_sha256: r.get(4)?,
             created_at: r.get(5)?,
             size_bytes: 0,
+            images_included: false,
+            image_count: 0,
+            images_missing: 0,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -266,15 +322,21 @@ async fn list_backups(
     for row in rows {
         let (backup_id, app_version, schema_version, path, checksum_sha256, created_at) = row?;
         let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        out.push(BackupView {
-            backup_id,
-            app_version,
-            schema_version,
-            path,
-            checksum_sha256,
-            created_at,
-            size_bytes,
-        });
+        out.push(
+            BackupView {
+                backup_id,
+                app_version,
+                schema_version,
+                path,
+                checksum_sha256,
+                created_at,
+                size_bytes,
+                images_included: false,
+                image_count: 0,
+                images_missing: 0,
+            }
+            .with_image_info(),
+        );
     }
 
     Ok(Json(out))
@@ -321,12 +383,42 @@ async fn verify_backup_handler(
 
     let result = verify_backup_file(Path::new(&path), &checksum)?;
 
+    // Bill photos: a backup that carries them is only valid if every photo is intact
+    // (full SHA-256 check of each stored copy). Database-only (legacy) backups have none.
+    let (images_included, images_ok, images) = if result.checksum_ok && result.integrity_ok {
+        match crate::bill_images::plan_restore(Path::new(&path), &id, &checksum) {
+            Ok(crate::bill_images::ImagePlan::Verified {
+                to_restore,
+                missing_at_backup,
+            }) => (
+                true,
+                true,
+                serde_json::json!({ "checked": to_restore.len(), "missing_at_backup": missing_at_backup }),
+            ),
+            Ok(crate::bill_images::ImagePlan::Legacy { referenced }) => (
+                false,
+                true,
+                serde_json::json!({ "checked": 0, "referenced_by_database": referenced.len() }),
+            ),
+            Err(_) => (true, false, serde_json::json!({ "checked": 0 })),
+        }
+    } else {
+        (
+            crate::bill_images::has_manifest(Path::new(&path)),
+            true,
+            serde_json::json!({ "checked": 0 }),
+        )
+    };
+
     Ok(Json(serde_json::json!({
         "backup_id": id,
         "checksum_ok": result.checksum_ok,
         "integrity_ok": result.integrity_ok,
         "schema_version": result.schema_version,
-        "valid": result.checksum_ok && result.integrity_ok,
+        "images_included": images_included,
+        "images_ok": images_ok,
+        "images": images,
+        "valid": result.checksum_ok && result.integrity_ok && images_ok,
     })))
 }
 
@@ -360,6 +452,9 @@ async fn restore_backup_handler(
                     checksum_sha256: r.get(4)?,
                     created_at: r.get(5)?,
                     size_bytes: 0,
+                    images_included: false,
+                    image_count: 0,
+                    images_missing: 0,
                 })
             },
         )
@@ -402,6 +497,11 @@ async fn restore_backup_handler(
         )));
     }
 
+    // 1b. Validate the backup's bill photos against the (now verified) database snapshot
+    // before anything live changes. A backup that carries photos must have every one of
+    // them intact; a database-only (legacy) backup has nothing to check.
+    let image_plan = crate::bill_images::plan_restore(Path::new(&path), &id, &checksum)?;
+
     // 2. Safety backup of current live state, taken before any destructive
     // action, per spec §10 ("create a safety backup of the current state").
     // The restore target (`id`) is explicitly preserved from this backup's
@@ -421,6 +521,54 @@ async fn restore_backup_handler(
     // already validly existed a moment ago, so it can't register anything
     // unverified as a backup.
     let pre_restore_backups = snapshot_all_backup_rows(&state)?;
+
+    // 2b. Make the backup's photos available in the live upload directory *before* the
+    // database is replaced. This only adds files (named by content hash); it never
+    // deletes or overwrites a good one, so if it fails here the live database is exactly
+    // as it was and the safety backup above is untouched. The database is therefore never
+    // restored without the photos it refers to.
+    let image_report = match &image_plan {
+        crate::bill_images::ImagePlan::Verified {
+            to_restore,
+            missing_at_backup,
+        } => match crate::bill_images::stage_images(
+            Path::new(&path),
+            &state.upload_dir,
+            to_restore,
+            &safety_backup.backup_id,
+        ) {
+            Ok(summary) => serde_json::json!({
+                "included": true,
+                "restored": summary.restored,
+                "already_present": summary.already_present,
+                "missing": missing_at_backup,
+            }),
+            Err(e) => {
+                tracing::error!(
+                    error = ?e,
+                    restored_backup_id = %id,
+                    safety_backup_id = %safety_backup.backup_id,
+                    "restoring bill photos failed; the database was not changed"
+                );
+                return Err(ApiError::RestoreFailed {
+                    client_message: "The restore did not complete: the bill photos could not be \
+                        copied back. Your records were not changed, and a safety backup was \
+                        taken immediately before this attempt."
+                        .to_string(),
+                    safety_backup_id: safety_backup.backup_id,
+                });
+            }
+        },
+        // Legacy backup: no photos to copy. Say how many the database refers to that are
+        // not on disk, so the owner is never left guessing.
+        crate::bill_images::ImagePlan::Legacy { referenced } => serde_json::json!({
+            "included": false,
+            "restored": 0,
+            "already_present": referenced.len()
+                - crate::bill_images::count_missing_live(&state.upload_dir, referenced),
+            "missing": crate::bill_images::count_missing_live(&state.upload_dir, referenced),
+        }),
+    };
 
     // 3. Restore the backup file's pages into the live, already-open
     // connection via SQLite's backup API (see module docs for why not a
@@ -578,5 +726,6 @@ async fn restore_backup_handler(
         "restored_backup_id": id,
         "safety_backup_id": safety_backup.backup_id,
         "current_session_still_valid": current_session_still_valid,
+        "images": image_report,
     })))
 }

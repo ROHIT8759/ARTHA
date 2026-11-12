@@ -13,6 +13,13 @@ fn test_app() -> axum::Router {
     build_app(state)
 }
 
+/// An app with the opt-in OCR development fixtures enabled (the default is off).
+fn fixture_app() -> axum::Router {
+    let mut state = AppState::for_tests(db::open_in_memory());
+    state.ocr_use_dev_fixtures = true;
+    build_app(state)
+}
+
 async fn body_json(resp: axum::response::Response) -> Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
@@ -383,7 +390,7 @@ async fn test_bill_image_upload_magic_bytes_and_retrieval() {
 
 #[tokio::test]
 async fn test_ocr_pipeline_and_human_review_workflow() {
-    let app = test_app();
+    let app = fixture_app();
     let token = setup_owner(&app).await;
 
     // Create a product to match against later
@@ -1220,9 +1227,10 @@ async fn test_bill_image_endpoints_require_auth_and_are_scoped_to_the_business()
 
 #[tokio::test]
 async fn test_ocr_response_flags_development_fixture_data() {
-    // With no engine configured outside production the server returns canned sample data.
-    // The response must say so, so a client can never present it as a real scan.
-    let app = test_app();
+    // With no engine configured and fixtures explicitly enabled in development, the
+    // server returns canned sample data. The response must say so, so a client can never
+    // present it as a real scan.
+    let app = fixture_app();
     let token = setup_owner(&app).await;
     let purchase_id = create_ocr_draft(&app, &token).await;
     let resp = app
@@ -1255,6 +1263,102 @@ async fn test_ocr_response_flags_development_fixture_data() {
     let body = body_json(resp).await;
     assert_eq!(body["is_dev_fixture"], true);
     assert_eq!(body["engine_version"], "artha_ocr_dev_fixture_v1");
+
+    // The purchase itself remembers that fixture data was produced, so the warning
+    // survives a reload even after the sample items were saved as a normal draft.
+    let get_purchase = |token: String, id: String| {
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/purchases/{id}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let view = body_json(
+        app.clone()
+            .oneshot(get_purchase(token.clone(), purchase_id.clone()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(view["ocr_is_dev_fixture"], true);
+
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/api/purchases/{purchase_id}"),
+            Some(&token),
+            json!({ "invoice_no": "X-1", "items": [] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["ocr_is_dev_fixture"], true);
+}
+
+/// Creates a draft + image on `state` and runs OCR; returns the OCR response status/body.
+async fn run_ocr_on(state: AppState) -> (StatusCode, Value) {
+    let app = build_app(state);
+    let token = setup_owner(&app).await;
+    let purchase_id = create_ocr_draft(&app, &token).await;
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{purchase_id}/image"),
+            &token,
+            "bill.png",
+            png_of_size(64),
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    let image_id = body_json(resp).await["image_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{purchase_id}/ocr"),
+            Some(&token),
+            json!({ "image_id": image_id }),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+#[tokio::test]
+async fn test_ocr_without_engine_and_without_opt_in_fails_with_manual_entry_guidance() {
+    // Default configuration: development environment, no engine, fixtures NOT enabled.
+    let state = AppState::for_tests(db::open_in_memory());
+    assert!(!state.ocr_use_dev_fixtures, "fixtures must default to off");
+    let (status, body) = run_ocr_on(state).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let msg = body["message"].as_str().unwrap();
+    assert!(msg.contains("not configured"), "{msg}");
+    assert!(msg.contains("manually"), "{msg}");
+    assert!(
+        body.get("is_dev_fixture").is_none(),
+        "no OCR result expected"
+    );
+    assert!(
+        body.get("parsed").is_none(),
+        "no suggestions may be fabricated"
+    );
+}
+
+#[tokio::test]
+async fn test_production_never_serves_fixtures_even_when_the_flag_is_set() {
+    let mut state = AppState::for_tests(db::open_in_memory());
+    state.environment = artha_server::config::Environment::Production;
+    state.ocr_use_dev_fixtures = true;
+    let (status, body) = run_ocr_on(state).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["message"].as_str().unwrap().contains("not configured"));
+    assert!(body.get("parsed").is_none());
 }
 
 #[tokio::test]
@@ -1315,4 +1419,170 @@ async fn test_ocr_engine_failure_response_does_not_leak_server_paths() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+async fn get_json(app: &axum::Router, token: &str, uri: &str) -> Value {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+    body_json(resp).await
+}
+
+async fn patch_purchase(
+    app: &axum::Router,
+    token: &str,
+    purchase_id: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            &format!("/api/purchases/{purchase_id}"),
+            Some(token),
+            body,
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+#[tokio::test]
+async fn test_invoice_date_is_saved_reloaded_validated_and_never_wiped_by_omission() {
+    let app = test_app();
+    let token = setup_owner(&app).await;
+    let id = create_ocr_draft(&app, &token).await;
+    let uri = format!("/api/purchases/{id}");
+
+    // A fresh draft has no date (and existing null-date purchases keep loading).
+    assert_eq!(get_json(&app, &token, &uri).await["invoice_date"], Value::Null);
+
+    // Saved, returned by the PATCH, and present after a reload.
+    let (status, view) = patch_purchase(
+        &app,
+        &token,
+        &id,
+        json!({ "invoice_no": "A-1", "invoice_date": "2026-10-12", "items": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["invoice_date"], "2026-10-12");
+    assert_eq!(get_json(&app, &token, &uri).await["invoice_date"], "2026-10-12");
+
+    // A save that does not mention the date (older client, partial form) keeps it.
+    let (status, view) = patch_purchase(&app, &token, &id, json!({ "invoice_no": "A-2", "items": [] })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["invoice_date"], "2026-10-12");
+    assert_eq!(view["invoice_no"], "A-2");
+
+    // Invalid dates are rejected and leave the stored value untouched.
+    for bad in [
+        "2026-02-30",
+        "2026-13-01",
+        "2026-00-10",
+        "2026-04-31",
+        "2025-02-29",
+        "12/10/2026",
+        "2026-1-5",
+        "2026-10-12T00:00:00",
+        "not-a-date",
+        "9999-01-01",
+        "１２３４-10-12",
+    ] {
+        let (status, body) = patch_purchase(
+            &app,
+            &token,
+            &id,
+            json!({ "invoice_date": bad, "items": [] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?} must be rejected");
+        assert!(body["message"].as_str().unwrap().contains("invoice_date"), "{bad:?}");
+    }
+    assert_eq!(get_json(&app, &token, &uri).await["invoice_date"], "2026-10-12");
+
+    // A leap day is valid; surrounding whitespace is trimmed.
+    let (status, view) = patch_purchase(
+        &app,
+        &token,
+        &id,
+        json!({ "invoice_date": " 2028-02-29 ", "items": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["invoice_date"], "2028-02-29");
+
+    // Explicit null and blank string both clear it.
+    let (_, view) = patch_purchase(&app, &token, &id, json!({ "invoice_date": null, "items": [] })).await;
+    assert_eq!(view["invoice_date"], Value::Null);
+    patch_purchase(&app, &token, &id, json!({ "invoice_date": "2026-10-12", "items": [] })).await;
+    let (_, view) = patch_purchase(&app, &token, &id, json!({ "invoice_date": "", "items": [] })).await;
+    assert_eq!(view["invoice_date"], Value::Null);
+    assert_eq!(get_json(&app, &token, &uri).await["invoice_date"], Value::Null);
+}
+
+#[tokio::test]
+async fn test_ocr_extracted_invoice_date_survives_save_edit_and_reload() {
+    let app = fixture_app();
+    let token = setup_owner(&app).await;
+    let id = create_ocr_draft(&app, &token).await;
+    let resp = app
+        .clone()
+        .oneshot(multipart_image_request(
+            &format!("/api/purchases/{id}/image"),
+            &token,
+            "bill.png",
+            png_of_size(64),
+            "image/png",
+        ))
+        .await
+        .unwrap();
+    let image_id = body_json(resp).await["image_id"].as_str().unwrap().to_string();
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{id}/ocr"),
+            Some(&token),
+            json!({ "image_id": image_id }),
+        ))
+        .await
+        .unwrap();
+    let ocr = body_json(resp).await;
+    let extracted = ocr["parsed"]["invoice_date"].as_str().unwrap().to_string();
+    assert_eq!(extracted, "2026-10-12");
+    // OCR itself persists nothing on the purchase.
+    let uri = format!("/api/purchases/{id}");
+    assert_eq!(get_json(&app, &token, &uri).await["invoice_date"], Value::Null);
+
+    // The user accepts the extracted date ...
+    let (status, _) = patch_purchase(&app, &token, &id, json!({ "invoice_date": extracted, "items": [] })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(get_json(&app, &token, &uri).await["invoice_date"], "2026-10-12");
+
+    // ... corrects it by hand, and a later OCR run does not touch the stored value.
+    patch_purchase(&app, &token, &id, json!({ "invoice_date": "2026-10-11", "items": [] })).await;
+    let resp = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/api/purchases/{id}/ocr"),
+            Some(&token),
+            json!({ "image_id": image_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(get_json(&app, &token, &uri).await["invoice_date"], "2026-10-11");
 }

@@ -67,6 +67,10 @@ pub struct PurchaseView {
     pub created_at: String,
     pub items: Vec<PurchaseItemView>,
     pub image_id: Option<String>,
+    /// True if any OCR run on this purchase returned canned development data. Sticky
+    /// on purpose: the line items may have been saved from that data, and the warning
+    /// must survive a reload, a re-upload, or a failed retry.
+    pub ocr_is_dev_fixture: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,12 +95,55 @@ pub struct UpdatePurchaseItemReq {
     pub price_paise: i64,
 }
 
+/// Distinguishes a field that is absent from one that is explicitly `null`:
+/// absent -> `None`, `null` -> `Some(None)`, a value -> `Some(Some(v))`.
+fn deserialize_present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpdatePurchaseRequest {
     pub supplier_id: Option<String>,
     pub invoice_no: Option<String>,
-    pub invoice_date: Option<String>,
+    /// `YYYY-MM-DD`. Omitted: keep the stored date. `null` or `""`: clear it.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub invoice_date: Option<Option<String>>,
     pub items: Vec<UpdatePurchaseItemReq>,
+}
+
+/// Validates an invoice date supplied by a client. Blank means "no date".
+fn validate_invoice_date(raw: &str) -> Result<Option<String>, ApiError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || {
+        ApiError::BadRequest("invoice_date must be a real calendar date in YYYY-MM-DD format".into())
+    };
+    // Strictly 4-2-2 digits: no `normalize_date` leniency for API input.
+    let b = raw.as_bytes();
+    let shape_ok = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    if !shape_ok {
+        return Err(invalid());
+    }
+    let (y, m, d) = (
+        raw[0..4].parse::<u32>().map_err(|_| invalid())?,
+        raw[5..7].parse::<u32>().map_err(|_| invalid())?,
+        raw[8..10].parse::<u32>().map_err(|_| invalid())?,
+    );
+    if !crate::ocr::is_valid_calendar_date(y, m, d) {
+        return Err(invalid());
+    }
+    Ok(Some(raw.to_string()))
 }
 
 async fn list_purchases(
@@ -136,6 +183,8 @@ async fn list_purchases(
             created_at: r.get(10)?,
             items: vec![],
             image_id: None,
+            // Not computed for list rows (kept cheap); the detail view has the real value.
+            ocr_is_dev_fixture: false,
         })
     })?;
 
@@ -180,11 +229,19 @@ async fn get_purchase(
                 created_at: r.get(10)?,
                 items: vec![],
                 image_id,
+                ocr_is_dev_fixture: false,
             })
         }
     ).map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
 
-    let mut stmt = conn.prepare("SELECT purchase_item_id, product_id, product_name_snapshot, batch, hsn_code, gst_rate_bps, quantity_milli, price_paise, line_total_paise FROM purchase_items WHERE purchase_id = ?1")?;
+    view.ocr_is_dev_fixture = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ocr_results o JOIN bill_images b ON b.image_id = o.image_id \
+         WHERE b.purchase_id = ?1 AND o.engine_version = ?2)",
+        rusqlite::params![id, crate::ocr::DEV_FIXTURE_ENGINE_VERSION],
+        |r| r.get::<_, bool>(0),
+    )?;
+
+    let mut stmt = conn.prepare("SELECT purchase_item_id, product_id, product_name_snapshot, batch, hsn_code, gst_rate_bps, quantity_milli, price_paise, line_total_paise FROM purchase_items WHERE purchase_id = ?1 ORDER BY rowid")?;
     let items_iter = stmt.query_map(rusqlite::params![id], |r| {
         Ok(PurchaseItemView {
             purchase_item_id: r.get(0)?,
@@ -238,6 +295,7 @@ async fn create_purchase(
         created_at: now,
         items: vec![],
         image_id: None,
+        ocr_is_dev_fixture: false,
     }))
 }
 
@@ -251,11 +309,11 @@ async fn update_purchase(
         let mut conn = state.db.lock().expect("db mutex poisoned");
         let tx = conn.transaction()?;
 
-        let status: String = tx
+        let (status, stored_invoice_date): (String, Option<String>) = tx
             .query_row(
-                "SELECT status FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
+                "SELECT status, invoice_date FROM purchases WHERE purchase_id = ?1 AND business_id = ?2",
                 rusqlite::params![id, user.business_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(|_| ApiError::NotFound("Purchase not found".into()))?;
 
@@ -264,6 +322,14 @@ async fn update_purchase(
                 "Only draft purchases can be edited".into(),
             ));
         }
+
+        // Validate before touching any rows. An omitted date keeps what is stored, so a
+        // client that does not know about the field can never wipe it.
+        let invoice_date = match &req.invoice_date {
+            None => stored_invoice_date,
+            Some(None) => None,
+            Some(Some(raw)) => validate_invoice_date(raw)?,
+        };
 
         // Process items & recalculate totals server-side
         tx.execute(
@@ -298,7 +364,7 @@ async fn update_purchase(
 
         tx.execute(
             "UPDATE purchases SET supplier_id = ?1, invoice_no = ?2, invoice_date = ?3, subtotal_paise = ?4, tax_total_paise = ?5, total_paise = ?6, updated_at = ?7 WHERE purchase_id = ?8",
-            rusqlite::params![req.supplier_id, req.invoice_no, req.invoice_date, subtotal, tax_total, grand_total, now, id]
+            rusqlite::params![req.supplier_id, req.invoice_no, invoice_date, subtotal, tax_total, grand_total, now, id]
         )?;
 
         tx.commit()?;
@@ -508,9 +574,15 @@ async fn upload_bill_image(
     }
 
     let file_path = state.upload_dir.join(format!("{sha256_hex}.{ext}"));
-    fs::write(&file_path, &bytes)
-        .await
-        .map_err(|e| ApiError::Internal(format!("failed to save upload: {e}")))?;
+    // Temp file + fsync + rename: a crash can never leave a truncated file under the
+    // content-addressed name that the database row (and backups) will refer to.
+    {
+        let (dest, data) = (file_path.clone(), bytes.to_vec());
+        tokio::task::spawn_blocking(move || crate::bill_images::write_file_atomic(&dest, &data))
+            .await
+            .map_err(|e| ApiError::Internal(format!("upload task failed: {e}")))?
+            .map_err(|e| ApiError::Internal(format!("failed to save upload: {e}")))?;
+    }
 
     let image_id = new_id();
     let now = now_iso();
@@ -518,7 +590,7 @@ async fn upload_bill_image(
     let conn = state.db.lock().expect("db mutex poisoned");
     conn.execute(
         "INSERT INTO bill_images (image_id, purchase_id, path, sha256_hex, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![image_id, id, file_path.to_str().unwrap(), sha256_hex, now],
+        rusqlite::params![image_id, id, file_path.to_string_lossy(), sha256_hex, now],
     )?;
 
     Ok(Json(serde_json::json!({
@@ -534,7 +606,7 @@ async fn get_bill_image(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let path: String = {
+    let stored: String = {
         let conn = state.db.lock().expect("db mutex poisoned");
         conn.query_row(
             "SELECT b.path FROM bill_images b JOIN purchases p ON b.purchase_id = p.purchase_id WHERE p.purchase_id = ?1 AND p.business_id = ?2 ORDER BY b.created_at DESC LIMIT 1",
@@ -544,19 +616,30 @@ async fn get_bill_image(
         .map_err(|_| ApiError::NotFound("Bill image not found".into()))?
     };
 
+    // Only the validated file name of the stored path is used, always inside the
+    // configured upload directory: a path in the database (for example from a restored
+    // backup made on another machine) can never make the server read an arbitrary file.
+    let path = crate::bill_images::resolve_upload_path(&state.upload_dir, &stored)
+        .ok_or_else(|| ApiError::NotFound("Bill image file not found on disk".into()))?;
+
     let bytes = fs::read(&path)
         .await
         .map_err(|_| ApiError::NotFound("Bill image file not found on disk".into()))?;
 
-    let mime = if path.ends_with(".png") {
-        "image/png"
-    } else if path.ends_with(".webp") {
-        "image/webp"
-    } else {
-        "image/jpeg"
+    let mime = match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        _ => "image/jpeg",
     };
 
-    Ok(([(axum::http::header::CONTENT_TYPE, mime)], bytes).into_response())
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, mime),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 use sha2::Digest;
@@ -573,7 +656,7 @@ async fn process_ocr(
     Json(req): Json<OcrRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // 1. Validate purchase is draft and belongs to this business
-    let image_path: String = {
+    let stored_path: String = {
         let conn = state.db.lock().expect("db mutex poisoned");
         let status: String = conn
             .query_row(
@@ -595,14 +678,11 @@ async fn process_ocr(
         .map_err(|_| ApiError::NotFound("Image not found on this purchase".into()))?
     };
 
-    // 2. Run OCR & Deterministic Bill Parser
-    let (payload, parsed) = crate::ocr::execute_ocr(
-        StdPath::new(&image_path),
-        state.paddle_ocr_cmd.as_deref(),
-        state.environment,
-        std::time::Duration::from_secs(state.ocr_timeout_secs),
-    )
-    .await?;
+    // 2. Run OCR & Deterministic Bill Parser (same safe path resolution as image download)
+    let image_path = crate::bill_images::resolve_upload_path(&state.upload_dir, &stored_path)
+        .ok_or_else(|| ApiError::NotFound("Image file not found on disk".into()))?;
+    let (payload, parsed) =
+        crate::ocr::execute_ocr(StdPath::new(&image_path), &state.ocr_settings()).await?;
 
     let ocr_id = new_id();
     let text_json = serde_json::to_string(&payload.tokens).unwrap_or_else(|_| "[]".to_string());
@@ -620,7 +700,7 @@ async fn process_ocr(
         "status": "completed",
         "ocr_id": ocr_id,
         // True when canned development data was returned instead of reading the image
-        // (no OCR engine configured and ARTHA_ENV is not `production`).
+        // (only possible with ARTHA_OCR_USE_DEV_FIXTURES on in a development environment).
         "is_dev_fixture": payload.engine_version == crate::ocr::DEV_FIXTURE_ENGINE_VERSION,
         "engine_version": payload.engine_version,
         "parsed": parsed,

@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod bill_images;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -35,9 +36,25 @@ pub struct AppState {
     pub environment: crate::config::Environment,
     pub paddle_ocr_cmd: Option<String>,
     pub ocr_timeout_secs: u64,
+    /// Raw `ARTHA_OCR_USE_DEV_FIXTURES` flag. Whether fixtures are actually
+    /// served is decided in `ocr::execute_ocr`, which also checks `environment`.
+    pub ocr_use_dev_fixtures: bool,
+    /// Bounds concurrent OCR engine processes (shared by every clone of the state).
+    pub ocr_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
+    /// The OCR-relevant slice of the state, passed to `ocr::execute_ocr`.
+    pub fn ocr_settings(&self) -> ocr::OcrSettings {
+        ocr::OcrSettings {
+            cmd: self.paddle_ocr_cmd.clone(),
+            environment: self.environment,
+            use_dev_fixtures: self.ocr_use_dev_fixtures,
+            timeout: std::time::Duration::from_secs(self.ocr_timeout_secs),
+            permits: self.ocr_permits.clone(),
+        }
+    }
+
     /// Convenience constructor for tests that don't exercise backup/restore
     /// directly: a harmless scratch backup dir (unique per process, so
     /// parallel `cargo test` runs never collide) and the documented default
@@ -56,6 +73,9 @@ impl AppState {
             environment: crate::config::Environment::Development,
             paddle_ocr_cmd: None,
             ocr_timeout_secs: 30,
+            // Tests opt in explicitly; the default is the production-safe one.
+            ocr_use_dev_fixtures: false,
+            ocr_permits: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
 }

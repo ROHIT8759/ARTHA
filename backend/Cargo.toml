@@ -14,7 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 axum = { version = "0.7", features = ["multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "process", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "process", "time", "sync", "io-util"] }
+# Kills the OCR engine's whole process tree (process group on Unix, Job Object on Windows)
+# without any `unsafe` code in this crate.
+process-wrap = { version = "8", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
 tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }

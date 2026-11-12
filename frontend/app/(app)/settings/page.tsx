@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef } from "react";
 import { useAuth } from "@/lib/auth-context";
-import { api, setToken, BusinessView, BackupView, BackupVerifyResult, formatBytes, formatRestoreErrorMessage } from "@/lib/api";
+import { api, setToken, BusinessView, BackupView, BackupVerifyResult, formatBytes, formatRestoreErrorMessage, describeBackupPhotos, describeRestoredPhotos } from "@/lib/api";
 import LoadingState from "@/components/ui/LoadingState";
 import ErrorState from "@/components/ui/ErrorState";
 
@@ -186,7 +186,7 @@ export default function SettingsPage() {
       if (result.current_session_still_valid) {
         setBackupFeedback({
           type: "success",
-          text: `Database restored. A safety backup of the prior state was saved (id: ${result.safety_backup_id}). Reloading...`,
+          text: `Database restored. A safety backup of the prior state was saved (id: ${result.safety_backup_id}). Reloading...${describeRestoredPhotos(result.images)}`,
         });
         // Virtually every piece of app state (products, sales, settings)
         // may have just changed underneath the running app; a full reload
@@ -201,7 +201,7 @@ export default function SettingsPage() {
         // (or redo setup, if the restored snapshot predates it).
         setBackupFeedback({
           type: "success",
-          text: `Database restored to an earlier state. A safety backup of the prior state was saved (id: ${result.safety_backup_id}). Your current login no longer exists in the restored data — redirecting to sign in again...`,
+          text: `Database restored to an earlier state. A safety backup of the prior state was saved (id: ${result.safety_backup_id}). Your current login no longer exists in the restored data — redirecting to sign in again...${describeRestoredPhotos(result.images)}`,
         });
         setTimeout(() => {
           setToken(null);
@@ -644,6 +644,7 @@ export default function SettingsPage() {
                 <th>Created</th>
                 <th>Size</th>
                 <th>Schema</th>
+                <th>Photos</th>
                 <th>Status</th>
                 <th></th>
               </tr>
@@ -660,6 +661,11 @@ export default function SettingsPage() {
                     <td>{formatBytes(b.size_bytes)}</td>
                     <td>v{b.schema_version}</td>
                     <td>
+                      <span style={{ color: (b.images_missing ?? 0) > 0 ? "var(--danger)" : undefined }}>
+                        {describeBackupPhotos(b)}
+                      </span>
+                    </td>
+                    <td>
                       {verify === undefined ? (
                         <span className="muted">Not checked</span>
                       ) : verify.valid ? (
@@ -669,6 +675,7 @@ export default function SettingsPage() {
                           ✗ Invalid
                           {!verify.checksum_ok ? " (checksum)" : ""}
                           {!verify.integrity_ok ? " (integrity)" : ""}
+                          {verify.images_ok === false ? " (photos)" : ""}
                         </span>
                       )}
                     </td>

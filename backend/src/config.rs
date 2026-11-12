@@ -38,6 +38,12 @@ pub struct Config {
     pub upload_dir: PathBuf,
     pub paddle_ocr_cmd: Option<String>,
     pub ocr_timeout_secs: u64,
+    /// Opt-in (`ARTHA_OCR_USE_DEV_FIXTURES`): when no OCR engine is configured,
+    /// return canned sample bill tokens instead of an error. Off by default and
+    /// ignored entirely in production; see [`Config::dev_fixtures_active`].
+    pub ocr_use_dev_fixtures: bool,
+    /// How many OCR engine processes may run at once (`ARTHA_OCR_MAX_CONCURRENCY`).
+    pub ocr_max_concurrency: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -48,6 +54,8 @@ pub enum ConfigError {
     InvalidBackupRetention(String),
     InvalidBackupInterval(String),
     InvalidOcrTimeout(String),
+    InvalidOcrFixtureFlag(String),
+    InvalidOcrConcurrency(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -83,6 +91,18 @@ impl fmt::Display for ConfigError {
                     "ARTHA_OCR_TIMEOUT_SECS must be a non-negative integer, got {v:?}"
                 )
             }
+            ConfigError::InvalidOcrFixtureFlag(v) => {
+                write!(
+                    f,
+                    "ARTHA_OCR_USE_DEV_FIXTURES must be one of true/false/1/0/yes/no/on/off, got {v:?}"
+                )
+            }
+            ConfigError::InvalidOcrConcurrency(v) => {
+                write!(
+                    f,
+                    "ARTHA_OCR_MAX_CONCURRENCY must be an integer between 1 and {MAX_OCR_CONCURRENCY}, got {v:?}"
+                )
+            }
         }
     }
 }
@@ -101,6 +121,12 @@ const DEFAULT_BACKUP_RETENTION: usize = 24;
 const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 3600;
 /// Default timeout for local OCR subprocess execution (30 seconds).
 const DEFAULT_OCR_TIMEOUT_SECS: u64 = 30;
+/// Default number of simultaneous OCR engine processes. PaddleOCR can use well over a
+/// gigabyte of RAM per run, and the server shares the shop PC with the cashier's work,
+/// so two (one scan while another finishes) is the most that is safe by default.
+const DEFAULT_OCR_MAX_CONCURRENCY: usize = 2;
+/// Upper bound accepted for `ARTHA_OCR_MAX_CONCURRENCY`.
+pub const MAX_OCR_CONCURRENCY: usize = 16;
 
 impl Config {
     /// Load configuration from the real process environment.
@@ -184,6 +210,24 @@ impl Config {
             None => DEFAULT_OCR_TIMEOUT_SECS,
         };
 
+        // Strict parse: a typo must not silently leave fixtures on or off.
+        let ocr_use_dev_fixtures = match get("ARTHA_OCR_USE_DEV_FIXTURES") {
+            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" | "" => false,
+                _ => return Err(ConfigError::InvalidOcrFixtureFlag(raw)),
+            },
+            None => false,
+        };
+
+        let ocr_max_concurrency = match get("ARTHA_OCR_MAX_CONCURRENCY") {
+            Some(raw) => match raw.trim().parse::<usize>() {
+                Ok(n) if (1..=MAX_OCR_CONCURRENCY).contains(&n) => n,
+                _ => return Err(ConfigError::InvalidOcrConcurrency(raw)),
+            },
+            None => DEFAULT_OCR_MAX_CONCURRENCY,
+        };
+
         // Resolve eagerly so a typo'd host fails fast at startup rather than
         // on the first incoming connection attempt.
         let _ = format!("{host}:{port}")
@@ -202,7 +246,16 @@ impl Config {
             upload_dir,
             paddle_ocr_cmd,
             ocr_timeout_secs,
+            ocr_use_dev_fixtures,
+            ocr_max_concurrency,
         })
+    }
+
+    /// Whether canned OCR fixtures may actually be served: the flag must be
+    /// set *and* the typed environment must be `Development`. Production never
+    /// serves fixtures, whatever the flag says.
+    pub fn dev_fixtures_active(&self) -> bool {
+        self.environment.is_development() && self.ocr_use_dev_fixtures
     }
 
     /// The address to bind the HTTP listener to.
@@ -239,6 +292,8 @@ mod tests {
         assert_eq!(cfg.upload_dir, PathBuf::from("data/uploads"));
         assert_eq!(cfg.paddle_ocr_cmd, None);
         assert_eq!(cfg.ocr_timeout_secs, 30);
+        assert!(!cfg.ocr_use_dev_fixtures, "fixtures must default to off");
+        assert!(!cfg.dev_fixtures_active());
     }
 
     #[test]
@@ -345,6 +400,66 @@ mod tests {
     fn rejects_invalid_environment() {
         let err = Config::from_lookup(lookup(&[("ARTHA_ENV", "staging")])).unwrap_err();
         assert_eq!(err, ConfigError::InvalidEnvironment("staging".to_string()));
+    }
+
+    #[test]
+    fn fixture_flag_parses_known_values_and_rejects_typos() {
+        for on in ["1", "true", "TRUE", "yes", "on", " On "] {
+            let cfg = Config::from_lookup(lookup(&[("ARTHA_OCR_USE_DEV_FIXTURES", on)])).unwrap();
+            assert!(cfg.ocr_use_dev_fixtures, "{on:?} should enable");
+        }
+        for off in ["0", "false", "no", "off", ""] {
+            let cfg = Config::from_lookup(lookup(&[("ARTHA_OCR_USE_DEV_FIXTURES", off)])).unwrap();
+            assert!(!cfg.ocr_use_dev_fixtures, "{off:?} should disable");
+        }
+        let err =
+            Config::from_lookup(lookup(&[("ARTHA_OCR_USE_DEV_FIXTURES", "ture")])).unwrap_err();
+        assert_eq!(err, ConfigError::InvalidOcrFixtureFlag("ture".to_string()));
+    }
+
+    #[test]
+    fn dev_fixtures_active_only_in_development_with_the_flag() {
+        let active = |env: Option<&str>, flag: Option<&str>| {
+            let mut vars = Vec::new();
+            if let Some(e) = env {
+                vars.push(("ARTHA_ENV", e));
+            }
+            if let Some(f) = flag {
+                vars.push(("ARTHA_OCR_USE_DEV_FIXTURES", f));
+            }
+            Config::from_lookup(lookup(&vars))
+                .unwrap()
+                .dev_fixtures_active()
+        };
+        // Environment x flag matrix (unset env defaults to development).
+        assert!(!active(None, None));
+        assert!(!active(Some("development"), None));
+        assert!(!active(Some("development"), Some("false")));
+        assert!(active(Some("development"), Some("true")));
+        assert!(active(None, Some("true")));
+        assert!(!active(Some("production"), None));
+        assert!(!active(Some("production"), Some("false")));
+        assert!(
+            !active(Some("production"), Some("true")),
+            "production must never serve fixtures, even with the flag set"
+        );
+    }
+
+    #[test]
+    fn ocr_concurrency_defaults_to_two_and_rejects_out_of_range_values() {
+        assert_eq!(
+            Config::from_lookup(lookup(&[]))
+                .unwrap()
+                .ocr_max_concurrency,
+            2
+        );
+        let cfg = Config::from_lookup(lookup(&[("ARTHA_OCR_MAX_CONCURRENCY", "4")])).unwrap();
+        assert_eq!(cfg.ocr_max_concurrency, 4);
+        for bad in ["0", "17", "-1", "two", ""] {
+            let err =
+                Config::from_lookup(lookup(&[("ARTHA_OCR_MAX_CONCURRENCY", bad)])).unwrap_err();
+            assert_eq!(err, ConfigError::InvalidOcrConcurrency(bad.to_string()));
+        }
     }
 
     #[test]

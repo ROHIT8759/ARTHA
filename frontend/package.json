@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --experimental-strip-types --test tests/formatters.test.mjs tests/bill-image-auth.test.mjs"
+    "test": "node --experimental-strip-types --test tests/formatters.test.mjs tests/bill-image-auth.test.mjs tests/purchase-draft.test.mjs"
   },
   "dependencies": {
     "next": "16.3.8",

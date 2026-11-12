@@ -7,6 +7,17 @@ import { api, formatPaise, ProductView, ParsedOcrBill } from "@/lib/api";
 import LoadingState from "@/components/ui/LoadingState";
 import ErrorState from "@/components/ui/ErrorState";
 import BillImage from "@/components/purchases/BillImage";
+import {
+  type DraftItem,
+  applyOcrToHeader,
+  buildSavePayload,
+  checkApprovable,
+  confirmQuantity,
+  fixtureWarningVisible,
+  mapOcrItems,
+  mergeSavedItems,
+  setQuantity,
+} from "@/lib/purchase-draft";
 
 export default function PurchaseDetailPage() {
   const params = useParams();
@@ -21,6 +32,7 @@ export default function PurchaseDetailPage() {
     tax_total_paise: number;
     total_paise: number;
     image_id?: string;
+    ocr_is_dev_fixture?: boolean;
   } | null>(null);
   const [products, setProducts] = useState<ProductView[]>([]);
   const [loading, setLoading] = useState(true);
@@ -28,18 +40,12 @@ export default function PurchaseDetailPage() {
 
   // Draft Edit State
   const [invoiceNo, setInvoiceNo] = useState("");
-  const [items, setItems] = useState<
-    Array<{
-      purchase_item_id?: string;
-      product_id?: string;
-      product_name_snapshot?: string;
-      quantity_milli: number;
-      price_paise: number;
-      gst_rate_bps: number;
-      confidence?: number;
-    }>
-  >([]);
+  const [invoiceDate, setInvoiceDate] = useState("");
+  // An OCR date that differs from the one already in the field: offered, never applied.
+  const [dateSuggestion, setDateSuggestion] = useState<string | null>(null);
+  const [items, setItems] = useState<DraftItem[]>([]);
   const [parsedOcr, setParsedOcr] = useState<ParsedOcrBill | null>(null);
+  // Sticky for this page session; the server's `ocr_is_dev_fixture` covers reloads.
   const [ocrIsFixture, setOcrIsFixture] = useState(false);
   const [saving, setSaving] = useState(false);
   const [approving, setApproving] = useState(false);
@@ -59,6 +65,7 @@ export default function PurchaseDetailPage() {
           setPurchase(purchaseData);
           setProducts(productsData);
           setInvoiceNo(purchaseData.invoice_no || "");
+          setInvoiceDate(purchaseData.invoice_date || "");
           setItems(purchaseData.items || []);
           setError(null);
         }
@@ -74,39 +81,58 @@ export default function PurchaseDetailPage() {
     };
   }, [purchaseId]);
 
-  const handleSaveDraft = async () => {
+  /** Saves the draft. Resolves `true` only if the server accepted and stored it. */
+  const saveDraft = async (announce: boolean): Promise<boolean> => {
+    // The date is always sent (a date or null) so the stored value and the screen cannot drift.
+    const built = buildSavePayload(invoiceNo, invoiceDate, items);
+    if (!built.ok) {
+      setError(built.error);
+      return false;
+    }
     setSaving(true);
     setError(null);
     try {
-      await api.updatePurchase(purchaseId, {
-        invoice_no: invoiceNo,
-        items: items.map((it) => ({
-          purchase_item_id: it.purchase_item_id,
-          product_id: it.product_id ? it.product_id : null,
-          product_name_snapshot: it.product_name_snapshot,
-          quantity_milli: it.quantity_milli,
-          price_paise: it.price_paise,
-          gst_rate_bps: it.gst_rate_bps,
-        })),
-      });
+      await api.updatePurchase(purchaseId, built.payload);
       // Refresh purchase to reflect updated authoritative backend totals
       const data = await api.getPurchase(purchaseId);
       setPurchase(data);
-      setItems(data.items || []);
-      alert("Draft saved!");
+      setInvoiceDate(data.invoice_date || "");
+      // Keep pending quantity reviews and confidence across the save.
+      setItems(mergeSavedItems(items, data.items || []));
+      if (announce) alert("Draft saved!");
+      return true;
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to save draft");
+      return false;
     } finally {
       setSaving(false);
     }
   };
 
+  const handleSaveDraft = async () => {
+    await saveDraft(true);
+  };
+
   const handleApprove = async () => {
-    if (!confirm("Are you sure? This will update inventory and cannot be undone.")) return;
+    const check = checkApprovable(items, invoiceDate);
+    if (!check.ok) {
+      setError(check.reason);
+      return;
+    }
+    if (
+      !confirm(
+        fixtureWarningVisible(purchase?.ocr_is_dev_fixture, ocrIsFixture)
+          ? "This draft contains made-up SAMPLE data from a development fixture, not text read from a real bill. Approve anyway? This will update inventory and cannot be undone."
+          : "Are you sure? This will update inventory and cannot be undone."
+      )
+    )
+      return;
     setApproving(true);
     setError(null);
     try {
-      await handleSaveDraft(); // Save first to ensure server has current edits
+      // Save first so the server has the current edits. If the save fails, stop: approving
+      // now would approve whatever was stored before, not what is on screen.
+      if (!(await saveDraft(false))) return;
       await api.approvePurchase(purchaseId);
       router.push("/purchases");
     } catch (err: unknown) {
@@ -148,27 +174,18 @@ export default function PurchaseDetailPage() {
       const { image_id } = await api.uploadBillImage(purchaseId, file);
       const ocrRes = await api.processOcr(purchaseId, image_id);
 
-      setOcrIsFixture(ocrRes.is_dev_fixture === true);
+      // Sticky: once fixture data has been shown on this page it stays flagged, even if a
+      // later retry returns something else or fails.
+      if (ocrRes.is_dev_fixture === true) setOcrIsFixture(true);
       if (ocrRes.parsed) {
         setParsedOcr(ocrRes.parsed);
-        if (ocrRes.parsed.invoice_no) {
-          setInvoiceNo(ocrRes.parsed.invoice_no);
-        }
-        const ocrItems = (ocrRes.parsed.items || []).map((i) => {
-          // Attempt smart match with catalog products by name
-          const matched = products.find(
-            (p) => p.name.trim().toLowerCase() === i.product_name_snapshot.trim().toLowerCase()
-          );
-          return {
-            product_id: matched ? matched.product_id : "",
-            product_name_snapshot: String(i.product_name_snapshot || ""),
-            quantity_milli: Number(i.quantity_milli || 1000),
-            price_paise: Number(i.price_paise || 0),
-            gst_rate_bps: Number(i.gst_rate_bps || 0),
-            confidence: i.confidence,
-          };
-        });
-        setItems(ocrItems);
+        // Header: the number follows OCR; the date is only filled when empty and a
+        // different OCR date is offered as a suggestion instead of replacing the user's.
+        const header = applyOcrToHeader({ invoiceNo, invoiceDate, dateSuggestion: null }, ocrRes.parsed);
+        setInvoiceNo(header.invoiceNo);
+        setInvoiceDate(header.invoiceDate);
+        setDateSuggestion(header.dateSuggestion);
+        setItems(mapOcrItems(ocrRes.parsed, products));
       }
 
       // Re-fetch purchase data to link image_id in header
@@ -195,6 +212,9 @@ export default function PurchaseDetailPage() {
 
   const isDraft = purchase.status === "draft";
   const hasUnresolved = items.some((i) => !i.product_id);
+  const hasQtyReview = items.some((i) => i.qtyReview);
+  const approval = checkApprovable(items, invoiceDate);
+  const showFixtureWarning = fixtureWarningVisible(purchase.ocr_is_dev_fixture, ocrIsFixture);
 
   // Client-side tentative totals calculation for draft view
   const tentativeSubtotal = items.reduce(
@@ -234,7 +254,8 @@ export default function PurchaseDetailPage() {
               <button
                 className="btn"
                 onClick={handleApprove}
-                disabled={approving || saving || hasUnresolved}
+                disabled={approving || saving || !approval.ok}
+                title={approval.reason ?? undefined}
               >
                 {approving ? "Approving..." : "Approve & Update Inventory"}
               </button>
@@ -286,7 +307,7 @@ export default function PurchaseDetailPage() {
         </div>
       )}
 
-      {isDraft && ocrIsFixture && (
+      {isDraft && showFixtureWarning && (
         <div
           role="alert"
           style={{
@@ -299,9 +320,9 @@ export default function PurchaseDetailPage() {
             fontSize: "0.9rem",
           }}
         >
-          <strong>Sample data, not read from your photo.</strong> This server has no OCR engine
-          configured and is not in production mode, so these items are made-up examples. Do not
-          approve them; enter the real bill details instead.
+          <strong>Sample data, not read from your photo.</strong> This server is in development
+          mode with sample OCR data switched on, so the suggested items on this draft are
+          made-up examples. Do not approve them; enter the real bill details instead.
         </div>
       )}
 
@@ -370,6 +391,42 @@ export default function PurchaseDetailPage() {
               {(parsedOcr?.invoice_no_confidence ?? 0) > 0 && (
                 <span className="muted" style={{ fontSize: "0.75rem", marginTop: "0.2rem", display: "block" }}>
                   OCR suggestion, not verified (confidence {Math.round((parsedOcr?.invoice_no_confidence ?? 0) * 100)}%)
+                </span>
+              )}
+            </div>
+            <div className="field" style={{ maxWidth: 320 }}>
+              <label htmlFor="invoice-date">Invoice Date</label>
+              <input
+                id="invoice-date"
+                type="date"
+                min="1990-01-01"
+                max="2100-12-31"
+                value={invoiceDate}
+                onChange={(e) => {
+                  setInvoiceDate(e.target.value);
+                  setDateSuggestion(null);
+                }}
+                disabled={!isDraft}
+              />
+              {isDraft && dateSuggestion && (
+                <span className="muted" style={{ fontSize: "0.75rem", marginTop: "0.2rem", display: "block" }}>
+                  OCR read a different date ({dateSuggestion}).{" "}
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ padding: "0.1rem 0.5rem", fontSize: "0.75rem" }}
+                    onClick={() => {
+                      setInvoiceDate(dateSuggestion);
+                      setDateSuggestion(null);
+                    }}
+                  >
+                    Use it
+                  </button>
+                </span>
+              )}
+              {isDraft && !dateSuggestion && (parsedOcr?.invoice_date_confidence ?? 0) > 0 && invoiceDate === parsedOcr?.invoice_date && (
+                <span className="muted" style={{ fontSize: "0.75rem", marginTop: "0.2rem", display: "block" }}>
+                  OCR suggestion, not verified (confidence {Math.round((parsedOcr?.invoice_date_confidence ?? 0) * 100)}%)
                 </span>
               )}
             </div>
@@ -444,6 +501,23 @@ export default function PurchaseDetailPage() {
           </div>
         )}
 
+        {hasQtyReview && isDraft && (
+          <div
+            role="note"
+            style={{
+              background: "#fef7e0",
+              color: "#b06000",
+              padding: "0.6rem 0.8rem",
+              borderRadius: 4,
+              marginTop: "1rem",
+              fontSize: "0.9rem",
+            }}
+          >
+            <strong>Action Required:</strong> Some quantities could not be told apart from pack sizes
+            (such as 5kg). Check each highlighted line against the bill and confirm it before approval.
+          </div>
+        )}
+
         <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", minWidth: 520, marginTop: "1rem" }}>
           <thead>
@@ -512,18 +586,45 @@ export default function PurchaseDetailPage() {
                       OCR suggestion, not verified (confidence {Math.round(it.confidence * 100)}%)
                     </span>
                   )}
+                  {isDraft && it.qtyReview && (
+                    <div
+                      role="alert"
+                      style={{
+                        marginTop: "0.4rem",
+                        padding: "0.4rem 0.6rem",
+                        borderRadius: 4,
+                        fontSize: "0.8rem",
+                        background: "rgba(179, 38, 30, 0.08)",
+                        color: "var(--danger)",
+                      }}
+                    >
+                      <strong>Check quantity.</strong> {it.qtyReview.note}{" "}
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        style={{ padding: "0.1rem 0.5rem", fontSize: "0.75rem" }}
+                        onClick={() => setItems(confirmQuantity(items, idx))}
+                      >
+                        Quantity is correct
+                      </button>
+                    </div>
+                  )}
                 </td>
                 <td>
                   <input
                     type="number"
                     value={it.quantity_milli}
                     onChange={(e) => {
-                      const newItems = [...items];
-                      newItems[idx].quantity_milli = parseInt(e.target.value) || 0;
-                      setItems(newItems);
+                      // Changing the quantity is the review this line was waiting for.
+                      setItems(setQuantity(items, idx, parseInt(e.target.value) || 0));
                     }}
                     disabled={!isDraft}
-                    style={{ width: "100%", textAlign: "right" }}
+                    aria-invalid={it.qtyReview ? true : undefined}
+                    style={{
+                      width: "100%",
+                      textAlign: "right",
+                      borderColor: it.qtyReview ? "var(--danger)" : undefined,
+                    }}
                   />
                 </td>
                 <td>
